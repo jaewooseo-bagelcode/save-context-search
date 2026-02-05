@@ -46,7 +46,7 @@ const EXCLUDED_DIRS: &[&str] = &[
 const CODE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "cs", "py"];
 
 /// Documentation file extensions
-const DOC_EXTENSIONS: &[&str] = &["md", "mdx", "txt"];
+const DOC_EXTENSIONS: &[&str] = &["md", "mdx", "txt", "json", "yaml", "yml", "toml", "xml", "rst"];
 
 /// IndexManager handles loading, saving, scanning, and locking index operations.
 pub struct IndexManager {
@@ -588,9 +588,10 @@ mod tests {
         let manager = IndexManager::load_or_create(temp_dir.path()).unwrap();
         let files = manager.scan_files().unwrap();
 
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(files.iter().any(|(p, t)| p.ends_with("test.rs") && *t == ChunkType::Code));
         assert!(files.iter().any(|(p, t)| p.ends_with("README.md") && *t == ChunkType::Doc));
+        assert!(files.iter().any(|(p, t)| p.ends_with("data.json") && *t == ChunkType::Doc));
     }
 
     #[test]

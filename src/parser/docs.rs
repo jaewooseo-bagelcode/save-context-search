@@ -1,8 +1,13 @@
 //! Documentation parser for markdown and text files.
 
 use std::path::Path;
+
 use anyhow::Result;
-use crate::{ChunkType, ChunkKind, RawChunk};
+
+use crate::{ChunkKind, ChunkType, RawChunk};
+
+const CHUNK_SIZE: usize = 500;
+const CHUNK_OVERLAP: usize = 100;
 
 pub struct DocsParser;
 
@@ -12,13 +17,18 @@ impl DocsParser {
     }
 
     pub fn parse(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_lowercase();
 
-        match ext {
+        match ext.as_str() {
             "md" | "mdx" => self.parse_markdown(path, content),
-            _ => self.parse_text(path, content),
+            "json" => self.parse_json(path, content),
+            "yaml" | "yml" => self.parse_yaml(path, content),
+            "toml" => self.parse_toml(path, content),
+            _ => self.parse_text_sliding_window(path, content),
         }
     }
 
@@ -30,7 +40,8 @@ impl DocsParser {
         // Add document chunk for entire file
         chunks.push(RawChunk {
             chunk_type: ChunkType::Doc,
-            name: path.file_name()
+            name: path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             kind: ChunkKind::Document,
@@ -75,7 +86,7 @@ impl DocsParser {
                         content: section_content,
                         context: None,
                         signature: None,
-                                });
+                    });
                 }
                 // Start new section
                 let name = line.trim_start_matches('#').trim().to_string();
@@ -112,29 +123,305 @@ impl DocsParser {
                 content: section_content,
                 context: None,
                 signature: None,
-                });
+            });
         }
 
         Ok(chunks)
     }
 
-    fn parse_text(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
-        let line_count = content.lines().count().max(1);
+    fn parse_json(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
+        if content.trim().is_empty() {
+            return self.parse_text_sliding_window(path, content);
+        }
 
-        Ok(vec![RawChunk {
-            chunk_type: ChunkType::Doc,
-            name: path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            kind: ChunkKind::Document,
-            line_start: 1,
-            line_end: line_count as u32,
-            byte_start: 0,
-            byte_end: content.len(),
-            content: content.to_string(),
-            context: None,
-            signature: None,
-        }])
+        match serde_json::from_str::<serde_json::Value>(content) {
+            Ok(serde_json::Value::Object(map)) if !map.is_empty() => {
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let mut chunks = Vec::new();
+                for (key, value) in map.iter() {
+                    let pretty = serde_json::to_string_pretty(value)
+                        .unwrap_or_else(|_| value.to_string());
+                    let chunk_content = format!("{}:\n{}", key, pretty);
+                    let line_count = chunk_content.lines().count().max(1);
+                    chunks.push(RawChunk {
+                        chunk_type: ChunkType::Doc,
+                        name: key.clone(),
+                        kind: ChunkKind::Section,
+                        line_start: 1,
+                        line_end: line_count as u32,
+                        byte_start: 0,
+                        byte_end: chunk_content.len(),
+                        content: chunk_content,
+                        context: Some(file_name.clone()),
+                        signature: None,
+                    });
+                }
+                Ok(chunks)
+            }
+            _ => self.parse_text_sliding_window(path, content),
+        }
+    }
+
+    fn parse_yaml(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
+        if content.trim().is_empty() {
+            return self.parse_text_sliding_window(path, content);
+        }
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let mut chunks = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut current_chunk = String::new();
+        let mut current_name = String::new();
+        let mut start_line = 0usize;
+        let mut start_byte = 0usize;
+        let mut current_byte = 0usize;
+        let mut found_key = false;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let is_top_level = !line.is_empty()
+                && !line.starts_with(' ')
+                && !line.starts_with('\t')
+                && !line.starts_with('#')
+                && !line.starts_with("---")
+                && !line.starts_with("...");
+
+            if is_top_level {
+                if !current_name.is_empty() {
+                    let name = current_name.clone();
+                    chunks.push(RawChunk {
+                        chunk_type: ChunkType::Doc,
+                        name,
+                        kind: ChunkKind::Section,
+                        line_start: start_line as u32 + 1,
+                        line_end: idx as u32,
+                        byte_start: start_byte,
+                        byte_end: current_byte,
+                        content: current_chunk.trim().to_string(),
+                        context: Some(file_name.clone()),
+                        signature: None,
+                    });
+                    current_chunk.clear();
+                    start_line = idx;
+                    start_byte = current_byte;
+                }
+
+                let name = line.split(':').next().unwrap_or("").trim();
+                current_name = if name.is_empty() {
+                    file_name.clone()
+                } else {
+                    name.to_string()
+                };
+                found_key = true;
+            }
+
+            current_chunk.push_str(line);
+            current_chunk.push('\n');
+            current_byte += line.len() + 1;
+        }
+
+        if !current_chunk.trim().is_empty() && found_key {
+            let name = if current_name.is_empty() {
+                file_name.clone()
+            } else {
+                current_name
+            };
+            chunks.push(RawChunk {
+                chunk_type: ChunkType::Doc,
+                name,
+                kind: ChunkKind::Section,
+                line_start: start_line as u32 + 1,
+                line_end: lines.len().max(1) as u32,
+                byte_start: start_byte,
+                byte_end: content.len(),
+                content: current_chunk.trim().to_string(),
+                context: Some(file_name.clone()),
+                signature: None,
+            });
+        }
+
+        if chunks.is_empty() {
+            return self.parse_text_sliding_window(path, content);
+        }
+
+        Ok(chunks)
+    }
+
+    fn parse_toml(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
+        if content.trim().is_empty() {
+            return self.parse_text_sliding_window(path, content);
+        }
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let mut chunks = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut current_chunk = String::new();
+        let mut current_name = String::new();
+        let mut start_line = 0usize;
+        let mut start_byte = 0usize;
+        let mut current_byte = 0usize;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let is_section_header = trimmed.starts_with('[') && !trimmed.starts_with("[#");
+
+            if is_section_header && !current_chunk.is_empty() {
+                let name = if current_name.is_empty() {
+                    "root".to_string()
+                } else {
+                    current_name.clone()
+                };
+                chunks.push(RawChunk {
+                    chunk_type: ChunkType::Doc,
+                    name,
+                    kind: ChunkKind::Section,
+                    line_start: start_line as u32 + 1,
+                    line_end: idx as u32,
+                    byte_start: start_byte,
+                    byte_end: current_byte,
+                    content: current_chunk.trim().to_string(),
+                    context: Some(file_name.clone()),
+                    signature: None,
+                });
+                current_chunk.clear();
+                start_line = idx;
+                start_byte = current_byte;
+            }
+
+            if is_section_header {
+                let name = trimmed
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim();
+                current_name = if name.is_empty() {
+                    "root".to_string()
+                } else {
+                    name.to_string()
+                };
+            }
+
+            current_chunk.push_str(line);
+            current_chunk.push('\n');
+            current_byte += line.len() + 1;
+        }
+
+        if !current_chunk.trim().is_empty() {
+            let name = if current_name.is_empty() {
+                "root".to_string()
+            } else {
+                current_name
+            };
+            chunks.push(RawChunk {
+                chunk_type: ChunkType::Doc,
+                name,
+                kind: ChunkKind::Section,
+                line_start: start_line as u32 + 1,
+                line_end: lines.len().max(1) as u32,
+                byte_start: start_byte,
+                byte_end: content.len(),
+                content: current_chunk.trim().to_string(),
+                context: Some(file_name.clone()),
+                signature: None,
+            });
+        }
+
+        if chunks.is_empty() {
+            return self.parse_text_sliding_window(path, content);
+        }
+
+        Ok(chunks)
+    }
+
+    fn parse_text_sliding_window(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if content.trim().is_empty() {
+            return Ok(vec![RawChunk {
+                chunk_type: ChunkType::Doc,
+                name: file_name,
+                kind: ChunkKind::Document,
+                line_start: 1,
+                line_end: 1,
+                byte_start: 0,
+                byte_end: 0,
+                content: String::new(),
+                context: None,
+                signature: None,
+            }]);
+        }
+
+        let mut char_to_byte = Vec::with_capacity(content.len() + 1);
+        for (byte_idx, _) in content.char_indices() {
+            char_to_byte.push(byte_idx);
+        }
+        char_to_byte.push(content.len());
+
+        let char_len = char_to_byte.len().saturating_sub(1);
+
+        if char_len <= CHUNK_SIZE {
+            let line_count = content.lines().count().max(1);
+            return Ok(vec![RawChunk {
+                chunk_type: ChunkType::Doc,
+                name: file_name,
+                kind: ChunkKind::Document,
+                line_start: 1,
+                line_end: line_count as u32,
+                byte_start: 0,
+                byte_end: content.len(),
+                content: content.to_string(),
+                context: None,
+                signature: None,
+            }]);
+        }
+
+        let mut chunks = Vec::new();
+        let mut chunk_num = 0;
+        let mut start = 0usize;
+
+        while start < char_len {
+            let end = std::cmp::min(start + CHUNK_SIZE, char_len);
+            let start_byte = char_to_byte[start];
+            let end_byte = char_to_byte[end];
+            let chunk_content = content[start_byte..end_byte].to_string();
+
+            let start_line = content[..start_byte].lines().count();
+            let end_line = content[..end_byte].lines().count();
+
+            chunk_num += 1;
+            chunks.push(RawChunk {
+                chunk_type: ChunkType::Doc,
+                name: format!("{} (part {})", file_name, chunk_num),
+                kind: ChunkKind::Paragraph,
+                line_start: (start_line + 1) as u32,
+                line_end: end_line.max(1) as u32,
+                byte_start: start_byte,
+                byte_end: end_byte,
+                content: chunk_content,
+                context: Some(file_name.clone()),
+                signature: None,
+            });
+
+            if start + CHUNK_SIZE >= char_len {
+                break;
+            }
+            start += CHUNK_SIZE - CHUNK_OVERLAP;
+        }
+
+        Ok(chunks)
     }
 }
 
@@ -156,10 +443,10 @@ mod tests {
         let content = "# Hello\n\nSome content\n\n# World\n\nMore content";
 
         let chunks = parser.parse(&path, content).unwrap();
-        
+
         // Should have document + 2 sections
         assert!(chunks.len() >= 2);
-        
+
         let hello = chunks.iter().find(|c| c.name == "Hello");
         assert!(hello.is_some());
         assert_eq!(hello.unwrap().kind, ChunkKind::Section);
@@ -172,8 +459,140 @@ mod tests {
         let content = "Just some plain text\nwith multiple lines";
 
         let chunks = parser.parse(&path, content).unwrap();
-        
+
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].kind, ChunkKind::Document);
+    }
+
+    #[test]
+    fn test_parse_json_object() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.json");
+        let content = r#"{"name": "test", "version": "1.0", "config": {"key": "value"}}"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 3);
+
+        let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"name"));
+        assert!(names.contains(&"version"));
+        assert!(names.contains(&"config"));
+    }
+
+    #[test]
+    fn test_parse_json_array_fallback() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.json");
+        let content = r#"[1, 2, 3]"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, ChunkKind::Document);
+    }
+
+    #[test]
+    fn test_parse_yaml() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.yaml");
+        let content = "name: test\nversion: 1.0\nconfig:\n  key: value";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_yaml_with_comments() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.yaml");
+        let content = "# Comment\nname: test\n# Another comment\nversion: 1.0";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_parse_toml() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.toml");
+        let content = "[package]\nname = \"test\"\n\n[dependencies]\nserde = \"1.0\"";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 2);
+
+        let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"package"));
+        assert!(names.contains(&"dependencies"));
+    }
+
+    #[test]
+    fn test_parse_toml_with_root() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.toml");
+        let content = "name = \"test\"\nversion = \"1.0\"\n\n[dependencies]";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].name, "root");
+    }
+
+    #[test]
+    fn test_parse_toml_array_tables() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.toml");
+        let content = "[[bin]]\nname = \"foo\"\n\n[[bin]]\nname = \"bar\"";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].name, "bin");
+        assert_eq!(chunks[1].name, "bin");
+    }
+
+    #[test]
+    fn test_parse_text_sliding_window_large() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.txt");
+        let content = "a".repeat(1000);
+
+        let chunks = parser.parse(&path, &content).unwrap();
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks[0].kind, ChunkKind::Paragraph);
+    }
+
+    #[test]
+    fn test_parse_text_sliding_window_small() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.txt");
+        let content = "small content";
+
+        let chunks = parser.parse(&path, content).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, ChunkKind::Document);
+    }
+
+    #[test]
+    fn test_parse_text_sliding_window_korean() {
+        let parser = DocsParser::new();
+        let path = PathBuf::from("test.txt");
+        let content = "가".repeat(600);
+
+        let chunks = parser.parse(&path, &content).unwrap();
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(!chunk.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_file() {
+        let parser = DocsParser::new();
+
+        let chunks = parser.parse(&PathBuf::from("test.json"), "").unwrap();
+        assert_eq!(chunks.len(), 1);
+
+        let chunks = parser.parse(&PathBuf::from("test.yaml"), "").unwrap();
+        assert_eq!(chunks.len(), 1);
+
+        let chunks = parser.parse(&PathBuf::from("test.toml"), "").unwrap();
+        assert_eq!(chunks.len(), 1);
     }
 }
