@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use save_context_search::{ChunkType, EmbedMode, SCS};
+use save_context_search::{ChunkType, EmbedMode, SCS, map};
 
 /// Context-efficient semantic search for code
 #[derive(Parser)]
@@ -82,6 +82,21 @@ enum Commands {
         /// Batch size (auto-scaled based on API tier if not specified)
         #[arg(long, short)]
         batch: Option<usize>,
+    },
+
+    /// Generate project map for AI context
+    Map {
+        /// Max tokens for output (default: 2000)
+        #[arg(long, default_value = "2000")]
+        max_tokens: usize,
+
+        /// Output format: auto, rust, typescript (or ts)
+        #[arg(long, default_value = "auto")]
+        format: String,
+
+        /// Include symbols without documentation
+        #[arg(long)]
+        include_undocumented: bool,
     },
 }
 
@@ -240,11 +255,47 @@ async fn main() -> Result<()> {
             let generated = scs.generate_embeddings(batch_size).await.context("Failed to generate embeddings")?;
             eprintln!("Generated {} embeddings", generated);
         }
+
+        Commands::Map { max_tokens, format, include_undocumented } => {
+            // Ensure index is fresh (no embedding needed for map)
+            scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
+
+            // Group chunks by module (now includes language info)
+            let modules = map::group_by_module(&scs.index.index, include_undocumented);
+
+            if modules.is_empty() {
+                eprintln!("[scs] No public documented symbols found. Try --include-undocumented");
+                return Ok(());
+            }
+
+            // Get project name from root directory
+            let project_name = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project");
+
+            // Format output (mixed is default, separates by language)
+            let output = match format.to_lowercase().as_str() {
+                "rust" | "rs" => {
+                    map::format_rust_map(project_name, &modules, max_tokens)
+                }
+                "typescript" | "ts" => {
+                    map::format_typescript_map(project_name, &modules, max_tokens)
+                }
+                "auto" | "mixed" | _ => {
+                    // Default: language-separated sections
+                    map::format_mixed_map(project_name, &modules, max_tokens)
+                }
+            };
+
+            println!("{}", output);
+        }
     }
 
     Ok(())
 }
 
+/// Detect if the project is primarily Rust or TypeScript/JavaScript
 /// Parse filter string to ChunkType
 fn parse_filter(filter: &Option<String>) -> Result<Option<ChunkType>> {
     match filter {

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod index;
 pub mod embeddings;
+pub mod map;
 pub mod parser;
 pub mod search;
 
@@ -142,6 +143,22 @@ pub enum Confidence {
     Low,
 }
 
+/// Symbol visibility (public/private)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    Public,     // pub, export
+    #[default]
+    Private,    // default
+}
+
+/// Doc comment information extracted from source
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DocInfo {
+    /// First paragraph summary (displayed in project map)
+    pub summary: String,
+}
+
 // ============================================================================
 // Index Data Structures (new binary format with string interning)
 // ============================================================================
@@ -158,6 +175,8 @@ pub struct Chunk {
     pub content_idx: u32,           // StringTable index
     pub context_idx: Option<u32>,   // StringTable index (parent class/section)
     pub signature_idx: Option<u32>, // StringTable index
+    pub doc_summary_idx: Option<u32>, // StringTable index (doc comment summary for map)
+    pub visibility: Visibility,     // Public/Private for map filtering
 }
 
 /// File tracking entry with chunk range.
@@ -310,6 +329,8 @@ pub struct RawChunk {
     pub content: String,
     pub context: Option<String>,
     pub signature: Option<String>,
+    pub doc_summary: Option<String>,  // Doc comment summary for map
+    pub visibility: Visibility,       // Public/Private for map filtering
 }
 
 // ============================================================================
@@ -550,6 +571,8 @@ impl SCS {
                 let context_idx = raw.context.as_ref().map(|c| self.index.index.strings.intern(c));
                 let signature_idx = raw.signature.as_ref().map(|s| self.index.index.strings.intern(s));
 
+                let doc_summary_idx = raw.doc_summary.as_ref().map(|s| self.index.index.strings.intern(s));
+
                 let chunk = Chunk {
                     chunk_type: raw.chunk_type,
                     name_idx,
@@ -560,6 +583,8 @@ impl SCS {
                     content_idx,
                     context_idx,
                     signature_idx,
+                    doc_summary_idx,
+                    visibility: raw.visibility,
                 };
                 self.index.index.chunks.push(chunk);
             }

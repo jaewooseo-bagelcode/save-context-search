@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::{ChunkKind, ChunkType, RawChunk};
+use crate::{ChunkKind, ChunkType, RawChunk, Visibility};
 
 const CHUNK_SIZE: usize = 500;
 const CHUNK_OVERLAP: usize = 100;
@@ -61,6 +61,8 @@ impl DocsParser {
             content,
             context,
             signature: None,
+            doc_summary: None,
+            visibility: Visibility::Private,
         }
     }
 
@@ -81,6 +83,8 @@ impl DocsParser {
             content: content.to_string(),
             context: None,
             signature: None,
+            doc_summary: None,
+            visibility: Visibility::Private,
         });
 
         // Find sections by headers
@@ -358,6 +362,8 @@ impl DocsParser {
                 content: String::new(),
                 context: None,
                 signature: None,
+                doc_summary: None,
+                visibility: Visibility::Private,
             }]);
         }
 
@@ -383,6 +389,8 @@ impl DocsParser {
                 content: content.to_string(),
                 context: None,
                 signature: None,
+                doc_summary: None,
+                visibility: Visibility::Private,
             }]);
         }
 
@@ -412,6 +420,8 @@ impl DocsParser {
                 content: chunk_content,
                 context: Some(file_name.clone()),
                 signature: None,
+                doc_summary: None,
+                visibility: Visibility::Private,
             });
 
             if end >= char_len {

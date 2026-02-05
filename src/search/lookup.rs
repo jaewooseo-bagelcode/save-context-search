@@ -200,7 +200,7 @@ pub fn outline(index: &Index, file: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Chunk, ChunkKind, StringTable};
+    use crate::{Chunk, ChunkKind, StringTable, Visibility};
 
     fn create_test_index() -> (Index, HashMap<u32, Vec<u32>>) {
         let mut strings = StringTable::new();
@@ -232,6 +232,8 @@ mod tests {
             content_idx,
             context_idx: None,
             signature_idx: None,
+            doc_summary_idx: None,
+            visibility: Visibility::Private,
         });
 
         // Build name_to_chunks

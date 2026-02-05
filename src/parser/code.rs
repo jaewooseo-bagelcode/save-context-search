@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Parser, Query, QueryCursor, Language, Node};
 use streaming_iterator::StreamingIterator;
 
-use crate::{ChunkType, ChunkKind, RawChunk};
+use crate::{ChunkType, ChunkKind, RawChunk, Visibility};
 use super::queries::{
     RUST_DEF_QUERY,
     TS_DEF_QUERY,
@@ -95,7 +95,7 @@ impl CodeParser {
         self.parser.set_language(&ts_lang)
             .context("Failed to set language")?;
 
-        parse_with_queries(path, content, &mut self.parser, lang.get_def_query(), ts_lang)
+        parse_with_queries(path, content, &mut self.parser, lang.get_def_query(), ts_lang, lang)
     }
 }
 
@@ -106,6 +106,7 @@ fn parse_with_queries(
     parser: &mut Parser,
     def_query_str: &str,
     lang: Language,
+    supported_lang: SupportedLanguage,
 ) -> Result<Vec<RawChunk>> {
     let tree = match parser.parse(content, None) {
         Some(t) => t,
@@ -189,6 +190,30 @@ fn parse_with_queries(
             kind
         };
 
+        // Parse doc comment and visibility based on language
+        let (doc_summary, visibility) = match supported_lang {
+            SupportedLanguage::Rust => {
+                let doc = parse_rust_doc_comment(sym_node, bytes);
+                let vis = parse_rust_visibility(sym_node);
+                (doc, vis)
+            }
+            SupportedLanguage::TypeScript | SupportedLanguage::Tsx | SupportedLanguage::JavaScript => {
+                let doc = parse_jsdoc_comment(sym_node, bytes);
+                let vis = parse_ts_visibility(sym_node, bytes);
+                (doc, vis)
+            }
+            SupportedLanguage::Python => {
+                let doc = parse_python_docstring(sym_node, bytes);
+                let vis = parse_python_visibility(&name);
+                (doc, vis)
+            }
+            SupportedLanguage::CSharp => {
+                let doc = parse_csharp_doc_comment(sym_node, bytes);
+                let vis = parse_csharp_visibility(sym_node, bytes);
+                (doc, vis)
+            }
+        };
+
         chunks.push(RawChunk {
             chunk_type: ChunkType::Code,
             name,
@@ -200,6 +225,8 @@ fn parse_with_queries(
             content: content_text,
             context,
             signature: Some(signature),
+            doc_summary,
+            visibility,
         });
     }
 
@@ -302,6 +329,357 @@ fn extract_type_name(type_node: Node, bytes: &[u8]) -> Option<String> {
             type_node.utf8_text(bytes).ok().map(|s| s.to_string())
         }
     }
+}
+
+// ============================================================================
+// Rust doc comment and visibility parsing
+// ============================================================================
+
+/// Parse Rust doc comments (///) from preceding siblings.
+/// Returns the first paragraph as summary (stops at empty line or # section).
+fn parse_rust_doc_comment(node: Node, bytes: &[u8]) -> Option<String> {
+    let mut comments = Vec::new();
+    let mut prev = node.prev_sibling();
+
+    // Collect consecutive /// comments going backwards
+    while let Some(sibling) = prev {
+        if sibling.kind() == "line_comment" {
+            if let Ok(text) = sibling.utf8_text(bytes) {
+                if text.starts_with("///") {
+                    // Remove /// prefix and trim
+                    let content = text.trim_start_matches("///").trim();
+                    comments.push(content.to_string());
+                } else {
+                    break; // Not a doc comment, stop
+                }
+            }
+        } else if sibling.kind() == "attribute_item" || sibling.kind() == "inner_attribute_item" {
+            // Skip attributes like #[derive(...)]
+        } else {
+            break;
+        }
+        prev = sibling.prev_sibling();
+    }
+
+    if comments.is_empty() {
+        return None;
+    }
+
+    // Reverse to get correct order
+    comments.reverse();
+
+    // Take first paragraph (stop at empty line or # section)
+    let summary: Vec<&str> = comments
+        .iter()
+        .take_while(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|s| s.as_str())
+        .collect();
+
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.join(" "))
+    }
+}
+
+/// Parse Rust visibility (checks for `pub` keyword).
+fn parse_rust_visibility(node: Node) -> Visibility {
+    // Check if first child is visibility_modifier (pub, pub(crate), etc.)
+    if let Some(child) = node.child(0) {
+        if child.kind() == "visibility_modifier" {
+            return Visibility::Public;
+        }
+    }
+
+    // For impl items, check if the method has pub
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if child.kind() == "visibility_modifier" {
+                return Visibility::Public;
+            }
+        }
+    }
+
+    Visibility::Private
+}
+
+// ============================================================================
+// TypeScript/JavaScript JSDoc and visibility parsing
+// ============================================================================
+
+/// Parse JSDoc comments (/** */) from preceding siblings.
+/// Returns the description before @tags as summary.
+fn parse_jsdoc_comment(node: Node, bytes: &[u8]) -> Option<String> {
+    // Look for comment in previous sibling
+    let prev = node.prev_sibling()?;
+
+    // Handle case where the comment might be before export_statement wrapping
+    let comment_node = if prev.kind() == "comment" {
+        prev
+    } else {
+        // Try parent's prev sibling for export statements
+        let parent = node.parent()?;
+        if parent.kind() == "export_statement" {
+            parent.prev_sibling().filter(|n| n.kind() == "comment")?
+        } else {
+            return None;
+        }
+    };
+
+    let text = comment_node.utf8_text(bytes).ok()?;
+
+    // Must be JSDoc style (/** ... */)
+    if !text.starts_with("/**") {
+        return None;
+    }
+
+    // Remove /** and */
+    let content = text
+        .trim_start_matches("/**")
+        .trim_end_matches("*/")
+        .trim();
+
+    // Parse lines, remove * prefix
+    let lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim().trim_start_matches('*').trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Take lines until we hit a @tag
+    let summary_lines: Vec<&str> = lines
+        .iter()
+        .take_while(|line| !line.starts_with('@'))
+        .copied()
+        .collect();
+
+    if summary_lines.is_empty() {
+        None
+    } else {
+        Some(summary_lines.join(" "))
+    }
+}
+
+/// Parse TypeScript/JavaScript visibility (checks for `export` keyword).
+fn parse_ts_visibility(node: Node, bytes: &[u8]) -> Visibility {
+    // Check if this is inside an export_statement
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "export_statement" {
+            return Visibility::Public;
+        }
+    }
+
+    // Check if the node itself contains "export" (for lexical_declaration with export)
+    if let Ok(text) = node.utf8_text(bytes) {
+        if text.starts_with("export ") {
+            return Visibility::Public;
+        }
+    }
+
+    Visibility::Private
+}
+
+// ============================================================================
+// Python docstring and visibility parsing
+// ============================================================================
+
+/// Parse Python docstring from function/class body.
+/// Looks for the first expression_statement containing a string as the docstring.
+/// Returns the first paragraph (stops at empty line) as summary.
+fn parse_python_docstring(node: Node, bytes: &[u8]) -> Option<String> {
+    // Find the body of the function/class
+    let body = node.child_by_field_name("body")?;
+
+    // Look for the first child that is an expression_statement containing a string
+    for i in 0..body.child_count() {
+        let child = body.child(i as u32)?;
+
+        // Skip non-expression statements at the start (e.g., comments)
+        if child.kind() != "expression_statement" {
+            continue;
+        }
+
+        // Look for a string child (the docstring)
+        for j in 0..child.child_count() {
+            if let Some(string_node) = child.child(j as u32) {
+                if string_node.kind() == "string" {
+                    return extract_docstring_summary(string_node, bytes);
+                }
+            }
+        }
+
+        // First expression_statement wasn't a docstring, so there's no docstring
+        break;
+    }
+
+    None
+}
+
+/// Extract summary from a Python string node (docstring).
+/// Handles both """ and ''' styles.
+fn extract_docstring_summary(string_node: Node, bytes: &[u8]) -> Option<String> {
+    let text = string_node.utf8_text(bytes).ok()?;
+
+    // Remove the triple quotes (""" or ''')
+    let content = if text.starts_with("\"\"\"") && text.ends_with("\"\"\"") {
+        text.trim_start_matches("\"\"\"").trim_end_matches("\"\"\"")
+    } else if text.starts_with("'''") && text.ends_with("'''") {
+        text.trim_start_matches("'''").trim_end_matches("'''")
+    } else if text.starts_with("\"") && text.ends_with("\"") {
+        // Regular single-line string
+        text.trim_start_matches("\"").trim_end_matches("\"")
+    } else if text.starts_with("'") && text.ends_with("'") {
+        text.trim_start_matches("'").trim_end_matches("'")
+    } else {
+        return None;
+    };
+
+    let content = content.trim();
+
+    if content.is_empty() {
+        return None;
+    }
+
+    // Take first paragraph (stop at empty line)
+    let summary_lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .take_while(|l| !l.is_empty())
+        .collect();
+
+    if summary_lines.is_empty() {
+        None
+    } else {
+        Some(summary_lines.join(" "))
+    }
+}
+
+/// Parse Python visibility based on naming conventions.
+/// - Names starting with `_` (but not `__x__` dunder) are private
+/// - Dunder methods like `__init__`, `__str__` are public
+/// - Everything else is public
+fn parse_python_visibility(name: &str) -> Visibility {
+    // Dunder methods (__init__, __str__, etc.) are public
+    if name.starts_with("__") && name.ends_with("__") {
+        return Visibility::Public;
+    }
+
+    // Names starting with _ or __ are private (convention)
+    if name.starts_with('_') {
+        return Visibility::Private;
+    }
+
+    Visibility::Public
+}
+
+// ============================================================================
+// C# XML doc comment and visibility parsing
+// ============================================================================
+
+/// Parse C# XML doc comments (///) from preceding siblings.
+/// Extracts text from <summary>...</summary> tags.
+fn parse_csharp_doc_comment(node: Node, bytes: &[u8]) -> Option<String> {
+    let mut comments = Vec::new();
+    let mut prev = node.prev_sibling();
+
+    // Collect consecutive /// comments going backwards
+    while let Some(sibling) = prev {
+        if sibling.kind() == "comment" {
+            if let Ok(text) = sibling.utf8_text(bytes) {
+                if text.starts_with("///") {
+                    // Remove /// prefix and trim
+                    let content = text.trim_start_matches("///").trim();
+                    comments.push(content.to_string());
+                } else {
+                    break; // Not a doc comment, stop
+                }
+            }
+        } else if sibling.kind() == "attribute_list" {
+            // Skip attributes like [Attribute]
+        } else {
+            break;
+        }
+        prev = sibling.prev_sibling();
+    }
+
+    if comments.is_empty() {
+        return None;
+    }
+
+    // Reverse to get correct order
+    comments.reverse();
+
+    // Join all lines into one string for XML parsing
+    let full_text = comments.join(" ");
+
+    // Extract content from <summary>...</summary> tags
+    extract_xml_summary(&full_text)
+}
+
+/// Extract text content from <summary>...</summary> XML tags.
+fn extract_xml_summary(text: &str) -> Option<String> {
+    // Simple extraction: find <summary> and </summary>
+    let start_tag = "<summary>";
+    let end_tag = "</summary>";
+
+    let start = text.find(start_tag)?;
+    let end = text.find(end_tag)?;
+
+    if start >= end {
+        return None;
+    }
+
+    let content = &text[start + start_tag.len()..end];
+
+    // Remove XML tags and clean up whitespace
+    let cleaned = strip_xml_tags(content.trim());
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Strip all XML tags from a string.
+fn strip_xml_tags(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+
+    // Normalize whitespace
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parse C# visibility from modifier keywords.
+/// - public, internal → Public
+/// - private, protected, no modifier → Private
+fn parse_csharp_visibility(node: Node, bytes: &[u8]) -> Visibility {
+    // Iterate through children to find modifier
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if child.kind() == "modifier" {
+                if let Ok(text) = child.utf8_text(bytes) {
+                    match text {
+                        "public" | "internal" => return Visibility::Public,
+                        "private" | "protected" => return Visibility::Private,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Default: no modifier means private in C#
+    Visibility::Private
 }
 
 impl Default for CodeParser {
@@ -502,6 +880,287 @@ public class Player {
 
         let chunks = parser.parse(&path, content).unwrap();
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rust_doc_comments() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.rs");
+        let content = r#"
+/// This is the main function.
+/// It does something important.
+///
+/// # Arguments
+/// * `x` - the input
+pub fn main_func(x: i32) -> i32 {
+    x + 1
+}
+
+/// A simple struct
+pub struct Player {
+    name: String,
+}
+
+fn private_func() {
+    // no doc comment
+}
+"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+
+        // Check main_func has doc summary and is public
+        let main_fn = chunks.iter().find(|c| c.name == "main_func");
+        assert!(main_fn.is_some(), "Should find main_func");
+        let main_fn = main_fn.unwrap();
+        assert_eq!(main_fn.visibility, Visibility::Public, "main_func should be public");
+        assert!(main_fn.doc_summary.is_some(), "main_func should have doc summary");
+        assert_eq!(
+            main_fn.doc_summary.as_ref().unwrap(),
+            "This is the main function. It does something important."
+        );
+
+        // Check Player struct is public with doc
+        let player = chunks.iter().find(|c| c.name == "Player");
+        assert!(player.is_some(), "Should find Player");
+        let player = player.unwrap();
+        assert_eq!(player.visibility, Visibility::Public, "Player should be public");
+        assert_eq!(player.doc_summary.as_ref().unwrap(), "A simple struct");
+
+        // Check private_func is private with no doc
+        let private_fn = chunks.iter().find(|c| c.name == "private_func");
+        assert!(private_fn.is_some(), "Should find private_func");
+        let private_fn = private_fn.unwrap();
+        assert_eq!(private_fn.visibility, Visibility::Private, "private_func should be private");
+        assert!(private_fn.doc_summary.is_none(), "private_func should have no doc");
+    }
+
+    #[test]
+    fn test_parse_typescript_jsdoc() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.ts");
+        let content = r#"
+/**
+ * Calculate the difficulty score.
+ * This is a very important function.
+ * @param level - The level setting
+ * @returns The difficulty score
+ */
+export function calculateDifficulty(level: number): number {
+    return level * 2;
+}
+
+/**
+ * A player class
+ */
+export class Player {
+    name: string;
+}
+
+function privateHelper() {
+    // no doc, not exported
+}
+
+/**
+ * Exported constant
+ */
+export const API_KEY = "test";
+"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+
+        // Check calculateDifficulty has doc summary and is exported (public)
+        let calc_fn = chunks.iter().find(|c| c.name == "calculateDifficulty");
+        assert!(calc_fn.is_some(), "Should find calculateDifficulty");
+        let calc_fn = calc_fn.unwrap();
+        assert_eq!(calc_fn.visibility, Visibility::Public, "calculateDifficulty should be public");
+        assert!(calc_fn.doc_summary.is_some(), "calculateDifficulty should have doc summary");
+        assert_eq!(
+            calc_fn.doc_summary.as_ref().unwrap(),
+            "Calculate the difficulty score. This is a very important function."
+        );
+
+        // Check Player class is exported with doc
+        let player = chunks.iter().find(|c| c.name == "Player");
+        assert!(player.is_some(), "Should find Player");
+        let player = player.unwrap();
+        assert_eq!(player.visibility, Visibility::Public, "Player should be public");
+        assert_eq!(player.doc_summary.as_ref().unwrap(), "A player class");
+
+        // Check privateHelper is private with no doc
+        let private_fn = chunks.iter().find(|c| c.name == "privateHelper");
+        assert!(private_fn.is_some(), "Should find privateHelper");
+        let private_fn = private_fn.unwrap();
+        assert_eq!(private_fn.visibility, Visibility::Private, "privateHelper should be private");
+        assert!(private_fn.doc_summary.is_none(), "privateHelper should have no doc");
+
+        // Check API_KEY constant
+        let api_key = chunks.iter().find(|c| c.name == "API_KEY");
+        assert!(api_key.is_some(), "Should find API_KEY");
+        let api_key = api_key.unwrap();
+        assert_eq!(api_key.visibility, Visibility::Public, "API_KEY should be public");
+    }
+
+    #[test]
+    fn test_parse_python_docstrings() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.py");
+        let content = r#"
+def calculate(x: int) -> int:
+    """Calculate the value.
+
+    This is additional description.
+
+    Args:
+        x: Input number
+    """
+    return x * 2
+
+class Player:
+    """A player class.
+
+    This handles player logic.
+    """
+
+    def __init__(self, name: str):
+        """Initialize the player."""
+        self.name = name
+
+    def _private_method(self):
+        """This is private."""
+        pass
+
+    def __internal(self):
+        """Double underscore private."""
+        pass
+
+def _helper():
+    '''Single quotes docstring.'''
+    pass
+"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+        println!("Python chunks: {:?}", chunks.iter().map(|c| (&c.name, &c.kind, &c.visibility)).collect::<Vec<_>>());
+
+        // Check calculate has doc summary and is public
+        let calc_fn = chunks.iter().find(|c| c.name == "calculate");
+        assert!(calc_fn.is_some(), "Should find calculate");
+        let calc_fn = calc_fn.unwrap();
+        assert_eq!(calc_fn.visibility, Visibility::Public, "calculate should be public");
+        assert!(calc_fn.doc_summary.is_some(), "calculate should have doc summary");
+        assert_eq!(
+            calc_fn.doc_summary.as_ref().unwrap(),
+            "Calculate the value."
+        );
+
+        // Check Player class is public with doc
+        let player = chunks.iter().find(|c| c.name == "Player" && c.kind == ChunkKind::Class);
+        assert!(player.is_some(), "Should find Player class");
+        let player = player.unwrap();
+        assert_eq!(player.visibility, Visibility::Public, "Player should be public");
+        assert_eq!(player.doc_summary.as_ref().unwrap(), "A player class.");
+
+        // Check __init__ is public (dunder method)
+        let init_fn = chunks.iter().find(|c| c.name == "__init__");
+        assert!(init_fn.is_some(), "Should find __init__");
+        let init_fn = init_fn.unwrap();
+        assert_eq!(init_fn.visibility, Visibility::Public, "__init__ should be public");
+        assert_eq!(init_fn.doc_summary.as_ref().unwrap(), "Initialize the player.");
+
+        // Check _private_method is private
+        let private_method = chunks.iter().find(|c| c.name == "_private_method");
+        assert!(private_method.is_some(), "Should find _private_method");
+        let private_method = private_method.unwrap();
+        assert_eq!(private_method.visibility, Visibility::Private, "_private_method should be private");
+        assert_eq!(private_method.doc_summary.as_ref().unwrap(), "This is private.");
+
+        // Check __internal is private (not dunder - no trailing __)
+        let internal = chunks.iter().find(|c| c.name == "__internal");
+        assert!(internal.is_some(), "Should find __internal");
+        let internal = internal.unwrap();
+        assert_eq!(internal.visibility, Visibility::Private, "__internal should be private");
+
+        // Check _helper is private with single-quote docstring
+        let helper = chunks.iter().find(|c| c.name == "_helper");
+        assert!(helper.is_some(), "Should find _helper");
+        let helper = helper.unwrap();
+        assert_eq!(helper.visibility, Visibility::Private, "_helper should be private");
+        assert_eq!(helper.doc_summary.as_ref().unwrap(), "Single quotes docstring.");
+    }
+
+    #[test]
+    fn test_parse_csharp_xml_docs() {
+        let mut parser = CodeParser::new().unwrap();
+        let path = PathBuf::from("test.cs");
+        let content = r#"
+/// <summary>A player class.</summary>
+public class Player {
+    /// <summary>
+    /// The player's name.
+    /// </summary>
+    public string Name { get; set; }
+
+    /// <summary>
+    /// Calculate the value.
+    /// This is important.
+    /// </summary>
+    /// <param name="x">Input number</param>
+    public int Calculate(int x) {
+        return x * 2;
+    }
+
+    private void InternalMethod() {
+        // no doc
+    }
+}
+
+internal class InternalHelper {
+    // internal is public
+}
+
+class DefaultClass {
+    // no modifier, default is private
+}
+"#;
+
+        let chunks = parser.parse(&path, content).unwrap();
+        println!("C# chunks: {:?}", chunks.iter().map(|c| (&c.name, &c.kind, &c.visibility)).collect::<Vec<_>>());
+
+        // Check Player class is public with doc
+        let player = chunks.iter().find(|c| c.name == "Player" && c.kind == ChunkKind::Class);
+        assert!(player.is_some(), "Should find Player class");
+        let player = player.unwrap();
+        assert_eq!(player.visibility, Visibility::Public, "Player should be public");
+        assert_eq!(player.doc_summary.as_ref().unwrap(), "A player class.");
+
+        // Check Calculate method has doc summary and is public
+        let calc_fn = chunks.iter().find(|c| c.name == "Calculate");
+        assert!(calc_fn.is_some(), "Should find Calculate");
+        let calc_fn = calc_fn.unwrap();
+        assert_eq!(calc_fn.visibility, Visibility::Public, "Calculate should be public");
+        assert!(calc_fn.doc_summary.is_some(), "Calculate should have doc summary");
+        assert_eq!(
+            calc_fn.doc_summary.as_ref().unwrap(),
+            "Calculate the value. This is important."
+        );
+
+        // Check InternalMethod is private
+        let internal_method = chunks.iter().find(|c| c.name == "InternalMethod");
+        assert!(internal_method.is_some(), "Should find InternalMethod");
+        let internal_method = internal_method.unwrap();
+        assert_eq!(internal_method.visibility, Visibility::Private, "InternalMethod should be private");
+        assert!(internal_method.doc_summary.is_none(), "InternalMethod should have no doc");
+
+        // Check InternalHelper is public (internal keyword)
+        let internal_helper = chunks.iter().find(|c| c.name == "InternalHelper");
+        assert!(internal_helper.is_some(), "Should find InternalHelper");
+        let internal_helper = internal_helper.unwrap();
+        assert_eq!(internal_helper.visibility, Visibility::Public, "InternalHelper should be public (internal)");
+
+        // Check DefaultClass is private (no modifier)
+        let default_class = chunks.iter().find(|c| c.name == "DefaultClass");
+        assert!(default_class.is_some(), "Should find DefaultClass");
+        let default_class = default_class.unwrap();
+        assert_eq!(default_class.visibility, Visibility::Private, "DefaultClass should be private (no modifier)");
     }
 
 }
