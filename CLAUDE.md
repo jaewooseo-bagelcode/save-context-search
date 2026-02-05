@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **save-context-search (scs)** is a context-efficient semantic search CLI tool for Claude Code that reduces token consumption by 90%+ when exploring codebases. It replaces the glob→grep→read workflow with intelligent symbol extraction and semantic search.
 
-**Status**: Pre-release research implementation. The specification is in `coderag-spec.md` (1,596 lines). Reference module in `ref/docs_rag/` is production-ready for Tauri integration.
+**Status**: Pre-release research implementation. The specification is in `coderag-spec.md` (1,596 lines).
 
 **Tech Stack**: Rust CLI + tree-sitter (code parsing) + OpenAI text-embedding-3-small + simsimd (vector similarity)
 
@@ -33,18 +33,13 @@ export OPENAI_API_KEY=sk-...   # Required for embeddings
 ```
 save-context-search/
 ├── coderag-spec.md              # Complete specification (canonical source)
-├── ref/                         # Reference implementation
-│   └── docs_rag/                # Production-ready Tauri module (2,066 LOC)
-│       ├── mod.rs               # Tauri commands
-│       ├── store.rs             # Vector store & search
-│       ├── embedder.rs          # OpenAI API client
-│       ├── chunker.rs           # Document parsing
-│       └── watcher.rs           # File system watcher
-└── src/ (per spec)
+├── plugin/                      # Claude Code plugin (skills, hooks, bundled binary)
+└── src/
     ├── main.rs                  # CLI entry (7 subcommands)
     ├── lib.rs                   # Core data structures
     ├── index/manager.rs         # Lazy incremental indexing
-    ├── parser/{code,docs}.rs    # tree-sitter + markdown parsing
+    ├── parser/code.rs           # tree-sitter code parsing
+    ├── parser/docs.rs           # Document parsing (MD, JSON, YAML, TOML, XML)
     ├── embeddings/openai.rs     # OpenAI batch embedding
     └── search/semantic.rs       # Cosine similarity search
 ```
@@ -76,7 +71,7 @@ save-context-search/
 ## Supported Languages & Formats
 
 **Code** (via tree-sitter): Rust (.rs), TypeScript/TSX, JavaScript/JSX, C# (.cs), Python (.py)
-**Docs**: Markdown (.md, .mdx), Plain text (.txt)
+**Docs**: Markdown (.md, .mdx), JSON, YAML (.yaml, .yml), TOML, XML, RST, Plain text (.txt)
 **Ignored**: node_modules, target, dist, build, .git, .scs
 
 ## Caching
@@ -110,10 +105,3 @@ scs lookup "PlayerController"  # Returns exact location (~950 tokens)
 Read /path/to/file:15-120      # Read only needed lines
 ```
 
-## Reference Implementation (ref/docs_rag/)
-
-Production-ready Tauri-integrated module. Key differences from main spec:
-- Cache dir: `.syntaxos/docs-rag/`
-- Additional formats: JSON, YAML, TOML, XML
-- Includes file watcher for real-time updates
-- Tauri commands: `init_docs_rag`, `auto_init_docs_rag`, `search_docs`, `get_docs_rag_status`, `stop_docs_rag`
