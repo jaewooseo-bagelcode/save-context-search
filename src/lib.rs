@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod index;
@@ -276,8 +277,9 @@ pub enum EmbedRecommendation {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EmbedMode {
+    /// Skip embedding entirely
     Skip,
-    Sync,
+    /// Auto-spawn background embed process when needed
     Auto,
 }
 
@@ -584,70 +586,36 @@ impl SCS {
         stats.pending_embeddings = total_chunks.saturating_sub(existing_embeddings);
         stats.embed_recommendation = Self::calculate_embed_recommendation(stats.pending_embeddings);
 
-        // 8. Generate embeddings based on mode
-        const SYNC_MAX_THRESHOLD: usize = 500;
-
-        let should_embed = match mode {
-            EmbedMode::Skip => false,
-            EmbedMode::Sync => {
-                // Sync mode: fail if too many pending embeddings
-                if stats.pending_embeddings > SYNC_MAX_THRESHOLD {
-                    // Save index first (so parsing work isn't lost)
-                    self.index.index.last_indexed = chrono::Utc::now().to_rfc3339();
-                    self.index.save().context("Failed to save index")?;
-
-                    anyhow::bail!(
-                        "Too many chunks to embed synchronously ({} > {} limit). \
-                        Use --no-embed to skip embeddings, or run 'scs embed' separately.",
-                        stats.pending_embeddings,
-                        SYNC_MAX_THRESHOLD
-                    );
-                }
-                true
-            }
-            EmbedMode::Auto => {
-                matches!(
-                    stats.embed_recommendation,
-                    EmbedRecommendation::Sync | EmbedRecommendation::SyncAcceptable
-                )
-            }
-        };
-
-        if should_embed && stats.pending_embeddings > 0 {
-            // Check rate limits first (requires mutable borrow)
-            if let Some(ref mut embedder) = self.embedder {
-                if let Err(e) = embedder.check_rate_limits().await {
-                    warn!("[scs] Warning: Failed to check rate limits: {}", e);
-                }
-            }
-
-            // Now use immutable borrow for embedding
-            if let Some(ref embedder) = self.embedder {
-                let chunks_to_embed = &self.index.index.chunks[existing_embeddings..];
-                let texts: Vec<String> = chunks_to_embed
-                    .iter()
-                    .map(|c| self.format_embedding_text(c))
-                    .collect();
-                let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-
-                match embedder.embed_batch(text_refs).await {
-                    Ok(new_embeddings) => {
-                        self.index.embeddings.extend(new_embeddings);
-                        stats.pending_embeddings = 0;
-                        stats.embed_recommendation = EmbedRecommendation::None;
+        // 8. Spawn background embed if needed (Auto mode only)
+        if mode == EmbedMode::Auto && stats.pending_embeddings > 0 {
+            if let Ok(exe_path) = std::env::current_exe() {
+                let root_str = self.index.root.to_string_lossy().to_string();
+                match Command::new(&exe_path)
+                    .args(["embed", "--path", &root_str])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => {
+                        warn!(
+                            "[scs] Started background embedding for {} chunks",
+                            stats.pending_embeddings
+                        );
                     }
                     Err(e) => {
-                        warn!("[scs] Warning: Failed to generate embeddings: {}", e);
+                        warn!(
+                            "[scs] Failed to start background embed: {}. Run 'scs embed' manually.",
+                            e
+                        );
                     }
                 }
+            } else {
+                warn!(
+                    "[scs] {} chunks need embeddings. Run 'scs embed' for semantic search.",
+                    stats.pending_embeddings
+                );
             }
-        }
-
-        if mode == EmbedMode::Auto && stats.embed_recommendation == EmbedRecommendation::Background {
-            eprintln!(
-                "[scs] {} chunks need embeddings. Run 'scs embed' in background for semantic search.",
-                stats.pending_embeddings
-            );
         }
 
         // 9. Update metadata and save

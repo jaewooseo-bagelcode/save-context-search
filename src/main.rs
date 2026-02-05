@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use save_context_search::{ChunkType, EmbedMode, EmbedRecommendation, SCS};
+use save_context_search::{ChunkType, EmbedMode, SCS};
 
 /// Context-efficient semantic search for code
 #[derive(Parser)]
@@ -65,13 +65,9 @@ enum Commands {
         #[arg(long, short)]
         quiet: bool,
 
-        /// Skip embedding generation (faster, but no semantic search)
-        #[arg(long, conflicts_with = "sync")]
+        /// Skip embedding generation (no background embed spawned)
+        #[arg(long)]
         no_embed: bool,
-
-        /// Force sync embedding (errors if >500 chunks). For testing.
-        #[arg(long, conflicts_with = "no_embed")]
-        sync: bool,
     },
 
     /// Force full reindex
@@ -180,18 +176,12 @@ async fn main() -> Result<()> {
             );
         }
 
-        Commands::Refresh { quiet, no_embed, sync } => {
+        Commands::Refresh { quiet, no_embed } => {
             // Set quiet mode to suppress warnings
             save_context_search::set_quiet_mode(quiet);
 
-            // Determine embedding mode (default: Auto)
-            let mode = if no_embed {
-                EmbedMode::Skip
-            } else if sync {
-                EmbedMode::Sync
-            } else {
-                EmbedMode::Auto
-            };
+            // Determine embedding mode (default: Auto spawns background embed)
+            let mode = if no_embed { EmbedMode::Skip } else { EmbedMode::Auto };
 
             // Non-blocking: if locked, mark dirty and exit
             let stats_opt = scs.try_refresh_or_mark_dirty(mode).await.context("Failed to refresh index")?;
@@ -199,20 +189,17 @@ async fn main() -> Result<()> {
             if !quiet {
                 match stats_opt {
                     Some(stats) if stats.has_changes() => {
-                        let embed_status = match (no_embed, stats.pending_embeddings) {
-                            (true, _) => " (no embeddings)".to_string(),
-                            (false, 0) => String::new(),
-                            (false, n) => format!(" ({} pending embeddings)", n),
+                        let embed_status = if no_embed {
+                            " (no embeddings)".to_string()
+                        } else if stats.pending_embeddings > 0 {
+                            " (background embed started)".to_string()
+                        } else {
+                            String::new()
                         };
                         eprintln!(
                             "Index updated: {} added, {} updated, {} removed{}",
                             stats.added, stats.updated, stats.removed, embed_status
                         );
-
-                        // Show recommendation if large project skipped embeddings
-                        if stats.embed_recommendation == EmbedRecommendation::Background {
-                            eprintln!("Tip: Run 'scs embed' in background for semantic search");
-                        }
                     }
                     Some(_) => {
                         eprintln!("Index is up to date");
