@@ -32,23 +32,52 @@ impl DocsParser {
         }
     }
 
+    /// Extract file name from path, defaulting to "unknown".
+    fn file_name(path: &Path) -> String {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    /// Create a section chunk with common defaults.
+    fn section_chunk(
+        name: String,
+        content: String,
+        line_start: u32,
+        line_end: u32,
+        byte_start: usize,
+        byte_end: usize,
+        context: Option<String>,
+    ) -> RawChunk {
+        RawChunk {
+            chunk_type: ChunkType::Doc,
+            name,
+            kind: ChunkKind::Section,
+            line_start,
+            line_end,
+            byte_start,
+            byte_end,
+            content,
+            context,
+            signature: None,
+        }
+    }
+
     fn parse_markdown(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
         let mut chunks = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
-        let bytes = content.as_bytes();
+        let file_name = Self::file_name(path);
 
         // Add document chunk for entire file
         chunks.push(RawChunk {
             chunk_type: ChunkType::Doc,
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+            name: file_name,
             kind: ChunkKind::Document,
             line_start: 1,
             line_end: lines.len().max(1) as u32,
             byte_start: 0,
-            byte_end: bytes.len(),
+            byte_end: content.len(),
             content: content.to_string(),
             context: None,
             signature: None,
@@ -75,25 +104,22 @@ impl DocsParser {
                 // End previous section
                 if let Some((start_line, name, start_byte)) = section_start.take() {
                     let section_content = lines[start_line..i].join("\n");
-                    chunks.push(RawChunk {
-                        chunk_type: ChunkType::Doc,
+                    chunks.push(Self::section_chunk(
                         name,
-                        kind: ChunkKind::Section,
-                        line_start: start_line as u32 + 1,
-                        line_end: i as u32,
-                        byte_start: start_byte,
-                        byte_end: line_byte_start,
-                        content: section_content,
-                        context: None,
-                        signature: None,
-                    });
+                        section_content,
+                        start_line as u32 + 1,
+                        i as u32,
+                        start_byte,
+                        line_byte_start,
+                        None,
+                    ));
                 }
                 // Start new section
-                let name = line.trim_start_matches('#').trim().to_string();
+                let name = line.trim_start_matches('#').trim();
                 let name = if name.is_empty() {
                     "Untitled Section".to_string()
                 } else {
-                    name
+                    name.to_string()
                 };
                 section_start = Some((i, name, line_byte_start));
             }
@@ -112,18 +138,15 @@ impl DocsParser {
         // Handle last section
         if let Some((start_line, name, start_byte)) = section_start {
             let section_content = lines[start_line..].join("\n");
-            chunks.push(RawChunk {
-                chunk_type: ChunkType::Doc,
+            chunks.push(Self::section_chunk(
                 name,
-                kind: ChunkKind::Section,
-                line_start: start_line as u32 + 1,
-                line_end: lines.len() as u32,
-                byte_start: start_byte,
-                byte_end: bytes.len(),
-                content: section_content,
-                context: None,
-                signature: None,
-            });
+                section_content,
+                start_line as u32 + 1,
+                lines.len() as u32,
+                start_byte,
+                content.len(),
+                None,
+            ));
         }
 
         Ok(chunks)
@@ -134,36 +157,33 @@ impl DocsParser {
             return self.parse_text_sliding_window(path, content);
         }
 
-        match serde_json::from_str::<serde_json::Value>(content) {
-            Ok(serde_json::Value::Object(map)) if !map.is_empty() => {
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+        let parsed = serde_json::from_str::<serde_json::Value>(content);
+        let map = match parsed {
+            Ok(serde_json::Value::Object(map)) if !map.is_empty() => map,
+            _ => return self.parse_text_sliding_window(path, content),
+        };
 
-                let mut chunks = Vec::new();
-                for (key, value) in map.iter() {
-                    let pretty = serde_json::to_string_pretty(value)
-                        .unwrap_or_else(|_| value.to_string());
-                    let chunk_content = format!("{}:\n{}", key, pretty);
-                    let line_count = chunk_content.lines().count().max(1);
-                    chunks.push(RawChunk {
-                        chunk_type: ChunkType::Doc,
-                        name: key.clone(),
-                        kind: ChunkKind::Section,
-                        line_start: 1,
-                        line_end: line_count as u32,
-                        byte_start: 0,
-                        byte_end: chunk_content.len(),
-                        content: chunk_content,
-                        context: Some(file_name.clone()),
-                        signature: None,
-                    });
-                }
-                Ok(chunks)
-            }
-            _ => self.parse_text_sliding_window(path, content),
-        }
+        let file_name = Self::file_name(path);
+        let chunks = map
+            .iter()
+            .map(|(key, value)| {
+                let pretty =
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+                let chunk_content = format!("{}:\n{}", key, pretty);
+                let line_count = chunk_content.lines().count().max(1);
+                Self::section_chunk(
+                    key.clone(),
+                    chunk_content.clone(),
+                    1,
+                    line_count as u32,
+                    0,
+                    chunk_content.len(),
+                    Some(file_name.clone()),
+                )
+            })
+            .collect();
+
+        Ok(chunks)
     }
 
     fn parse_yaml(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
@@ -171,13 +191,9 @@ impl DocsParser {
             return self.parse_text_sliding_window(path, content);
         }
 
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let mut chunks = Vec::new();
+        let file_name = Self::file_name(path);
         let lines: Vec<&str> = content.lines().collect();
+        let mut chunks = Vec::new();
         let mut current_chunk = String::new();
         let mut current_name = String::new();
         let mut start_line = 0usize;
@@ -193,26 +209,22 @@ impl DocsParser {
                 && !line.starts_with("---")
                 && !line.starts_with("...");
 
-            if is_top_level {
-                if !current_name.is_empty() {
-                    let name = current_name.clone();
-                    chunks.push(RawChunk {
-                        chunk_type: ChunkType::Doc,
-                        name,
-                        kind: ChunkKind::Section,
-                        line_start: start_line as u32 + 1,
-                        line_end: idx as u32,
-                        byte_start: start_byte,
-                        byte_end: current_byte,
-                        content: current_chunk.trim().to_string(),
-                        context: Some(file_name.clone()),
-                        signature: None,
-                    });
-                    current_chunk.clear();
-                    start_line = idx;
-                    start_byte = current_byte;
-                }
+            if is_top_level && !current_name.is_empty() {
+                chunks.push(Self::section_chunk(
+                    current_name.clone(),
+                    current_chunk.trim().to_string(),
+                    start_line as u32 + 1,
+                    idx as u32,
+                    start_byte,
+                    current_byte,
+                    Some(file_name.clone()),
+                ));
+                current_chunk.clear();
+                start_line = idx;
+                start_byte = current_byte;
+            }
 
+            if is_top_level {
                 let name = line.split(':').next().unwrap_or("").trim();
                 current_name = if name.is_empty() {
                     file_name.clone()
@@ -233,18 +245,15 @@ impl DocsParser {
             } else {
                 current_name
             };
-            chunks.push(RawChunk {
-                chunk_type: ChunkType::Doc,
+            chunks.push(Self::section_chunk(
                 name,
-                kind: ChunkKind::Section,
-                line_start: start_line as u32 + 1,
-                line_end: lines.len().max(1) as u32,
-                byte_start: start_byte,
-                byte_end: content.len(),
-                content: current_chunk.trim().to_string(),
-                context: Some(file_name.clone()),
-                signature: None,
-            });
+                current_chunk.trim().to_string(),
+                start_line as u32 + 1,
+                lines.len().max(1) as u32,
+                start_byte,
+                content.len(),
+                Some(file_name.clone()),
+            ));
         }
 
         if chunks.is_empty() {
@@ -259,13 +268,9 @@ impl DocsParser {
             return self.parse_text_sliding_window(path, content);
         }
 
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let mut chunks = Vec::new();
+        let file_name = Self::file_name(path);
         let lines: Vec<&str> = content.lines().collect();
+        let mut chunks = Vec::new();
         let mut current_chunk = String::new();
         let mut current_name = String::new();
         let mut start_line = 0usize;
@@ -282,18 +287,15 @@ impl DocsParser {
                 } else {
                     current_name.clone()
                 };
-                chunks.push(RawChunk {
-                    chunk_type: ChunkType::Doc,
+                chunks.push(Self::section_chunk(
                     name,
-                    kind: ChunkKind::Section,
-                    line_start: start_line as u32 + 1,
-                    line_end: idx as u32,
-                    byte_start: start_byte,
-                    byte_end: current_byte,
-                    content: current_chunk.trim().to_string(),
-                    context: Some(file_name.clone()),
-                    signature: None,
-                });
+                    current_chunk.trim().to_string(),
+                    start_line as u32 + 1,
+                    idx as u32,
+                    start_byte,
+                    current_byte,
+                    Some(file_name.clone()),
+                ));
                 current_chunk.clear();
                 start_line = idx;
                 start_byte = current_byte;
@@ -322,18 +324,15 @@ impl DocsParser {
             } else {
                 current_name
             };
-            chunks.push(RawChunk {
-                chunk_type: ChunkType::Doc,
+            chunks.push(Self::section_chunk(
                 name,
-                kind: ChunkKind::Section,
-                line_start: start_line as u32 + 1,
-                line_end: lines.len().max(1) as u32,
-                byte_start: start_byte,
-                byte_end: content.len(),
-                content: current_chunk.trim().to_string(),
-                context: Some(file_name.clone()),
-                signature: None,
-            });
+                current_chunk.trim().to_string(),
+                start_line as u32 + 1,
+                lines.len().max(1) as u32,
+                start_byte,
+                content.len(),
+                Some(file_name.clone()),
+            ));
         }
 
         if chunks.is_empty() {
@@ -344,11 +343,9 @@ impl DocsParser {
     }
 
     fn parse_text_sliding_window(&self, path: &Path, content: &str) -> Result<Vec<RawChunk>> {
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let file_name = Self::file_name(path);
 
+        // Handle empty content
         if content.trim().is_empty() {
             return Ok(vec![RawChunk {
                 chunk_type: ChunkType::Doc,
@@ -364,14 +361,15 @@ impl DocsParser {
             }]);
         }
 
-        let mut char_to_byte = Vec::with_capacity(content.len() + 1);
-        for (byte_idx, _) in content.char_indices() {
-            char_to_byte.push(byte_idx);
-        }
-        char_to_byte.push(content.len());
-
+        // Build character-to-byte index for Unicode-safe slicing
+        let char_to_byte: Vec<usize> = content
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(content.len()))
+            .collect();
         let char_len = char_to_byte.len().saturating_sub(1);
 
+        // Small content fits in single document chunk
         if char_len <= CHUNK_SIZE {
             let line_count = content.lines().count().max(1);
             return Ok(vec![RawChunk {
@@ -388,12 +386,13 @@ impl DocsParser {
             }]);
         }
 
+        // Split into overlapping chunks
         let mut chunks = Vec::new();
         let mut chunk_num = 0;
         let mut start = 0usize;
 
         while start < char_len {
-            let end = std::cmp::min(start + CHUNK_SIZE, char_len);
+            let end = (start + CHUNK_SIZE).min(char_len);
             let start_byte = char_to_byte[start];
             let end_byte = char_to_byte[end];
             let chunk_content = content[start_byte..end_byte].to_string();
@@ -415,7 +414,7 @@ impl DocsParser {
                 signature: None,
             });
 
-            if start + CHUNK_SIZE >= char_len {
+            if end >= char_len {
                 break;
             }
             start += CHUNK_SIZE - CHUNK_OVERLAP;
