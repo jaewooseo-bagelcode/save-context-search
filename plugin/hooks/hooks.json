@@ -1,0 +1,29 @@
+{
+  "description": "Auto-refresh SCS index and encourage SCS usage over grep/glob/read",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scs refresh --quiet",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scs refresh --quiet",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

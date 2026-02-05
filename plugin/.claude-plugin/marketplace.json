@@ -1,0 +1,24 @@
+{
+  "name": "scs-marketplace",
+  "owner": {
+    "name": "Jaewoo Seo",
+    "email": "local@local"
+  },
+  "metadata": {
+    "description": "SCS plugin marketplace",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "scs",
+      "source": "./",
+      "description": "Context-efficient semantic search for code. Reduces token usage by 90%+.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Jaewoo Seo"
+      },
+      "keywords": ["search", "semantic", "code", "index"],
+      "category": "productivity"
+    }
+  ]
+}

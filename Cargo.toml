@@ -1,0 +1,36 @@
+[package]
+name = "save-context-search"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "scs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-python = "0.25"
+simsimd = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+anyhow = "1"
+futures = "0.3"
+walkdir = "2"
+sha2 = "0.10"
+chrono = "0.4"
+streaming-iterator = "0.1.9"
+
+[profile.release]
+lto = true
+strip = true
+
+[dev-dependencies]
+tempfile = "3.24.0"

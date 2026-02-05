@@ -1,0 +1,10 @@
+{
+  "name": "scs",
+  "description": "Context-efficient semantic search for code. Reduces token usage by 90%+ when exploring codebases.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jaewoo Seo"
+  },
+  "repository": "https://github.com/jaewooseo/save-context-search",
+  "keywords": ["search", "semantic", "code", "index", "codebase"]
+}
