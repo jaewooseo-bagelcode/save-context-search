@@ -1,5 +1,5 @@
 {
-  "description": "Auto-refresh SCS index and encourage SCS usage over grep/glob/read",
+  "description": "SCS: Auto-refresh index + inject project map for AI context",
   "hooks": {
     "SessionStart": [
       {
@@ -9,6 +9,12 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/scs refresh --quiet",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scs map",
+            "timeout": 10,
+            "statusMessage": "Loading project map..."
           }
         ]
       }
