@@ -9,15 +9,15 @@ SCS="${CLAUDE_PLUGIN_ROOT}/bin/scs"
 "$SCS" map 2>/dev/null
 
 # Agent workflow guide (injected as context)
-cat <<'WORKFLOW'
+# NOTE: unquoted heredoc so $SCS expands to the actual binary path
+cat <<WORKFLOW
 
 // ── SCS Agent Workflow ──────────────────────────────────────
-// Navigate: scs map --area <dir>          → zoom into module
-//           scs map --area <file>         → see all functions
-// Locate:   scs lookup "<SymbolName>"     → exact file:line
-//           scs search "<concept>"        → find by meaning
-// Read:     Read file:line_start-line_end → only needed lines
+// Navigate: $SCS map --area <dir>          → zoom into module
+//           $SCS map --area <file>         → see all functions
+// Locate:   $SCS lookup "<SymbolName>"     → exact file:line
+//           $SCS search "<concept>"        → find by meaning
+// Read:     Read file:line_start-line_end  → only needed lines
 //
 // Flow: map (above) → zoom (map --area) → locate → read
-// Binary: ${CLAUDE_PLUGIN_ROOT}/bin/scs
 WORKFLOW
