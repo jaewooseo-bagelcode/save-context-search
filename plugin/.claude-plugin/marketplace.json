@@ -13,7 +13,7 @@
       "name": "scs",
       "source": "./",
       "description": "Project map, semantic search, and symbol lookup for code. Reduces token usage by 90%+.",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "author": {
         "name": "Jaewoo Seo"
       },
