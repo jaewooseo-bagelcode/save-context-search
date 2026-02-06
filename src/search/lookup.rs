@@ -164,7 +164,6 @@ mod tests {
             context_idx: None,
             signature_idx: None,
             doc_summary_idx: None,
-            llm_summary_idx: None,
             visibility: Visibility::Private,
         });
 

@@ -13,8 +13,8 @@ use crate::{ChunkType, Index};
 use super::cache::{compute_hash, get_mtime};
 
 /// Index format version - increment when Index struct changes
-/// v3: Added llm_summary_idx to Chunk
-const FORMAT_VERSION: u32 = 3;
+/// v2: Added doc_summary_idx to Chunk
+const FORMAT_VERSION: u32 = 2;
 
 /// Magic bytes for index file validation
 const MAGIC: &[u8; 4] = b"SCS\x01";

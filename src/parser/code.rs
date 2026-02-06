@@ -226,7 +226,6 @@ fn parse_with_queries(
             context,
             signature: Some(signature),
             doc_summary,
-            llm_summary: None,
             visibility,
         });
     }

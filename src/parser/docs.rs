@@ -62,7 +62,6 @@ impl DocsParser {
             context,
             signature: None,
             doc_summary: None,
-            llm_summary: None,
             visibility: Visibility::Private,
         }
     }
@@ -85,7 +84,6 @@ impl DocsParser {
             context: None,
             signature: None,
             doc_summary: None,
-            llm_summary: None,
             visibility: Visibility::Private,
         });
 
@@ -365,7 +363,6 @@ impl DocsParser {
                 context: None,
                 signature: None,
                 doc_summary: None,
-                llm_summary: None,
                 visibility: Visibility::Private,
             }]);
         }
@@ -393,7 +390,6 @@ impl DocsParser {
                 context: None,
                 signature: None,
                 doc_summary: None,
-                llm_summary: None,
                 visibility: Visibility::Private,
             }]);
         }
@@ -425,7 +421,6 @@ impl DocsParser {
                 context: Some(file_name.clone()),
                 signature: None,
                 doc_summary: None,
-                llm_summary: None,
                 visibility: Visibility::Private,
             });
 

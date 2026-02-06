@@ -115,10 +115,10 @@ pub fn detect_zoom_level(area: &str, dirs: &[DirNode]) -> ZoomLevel {
         let dir_part = extract_dir_path(area_norm);
         let file_part = extract_file_name(area_norm);
         for dir in dirs {
-            if dir.path == dir_part {
-                if dir.files.iter().any(|f| f.name == file_part) {
-                    return ZoomLevel::File;
-                }
+            if dir.path == dir_part
+                && dir.files.iter().any(|f| f.name == file_part)
+            {
+                return ZoomLevel::File;
             }
         }
     }
@@ -205,10 +205,7 @@ pub fn zoom_hint(zoom: ZoomLevel, area: &str, dirs: &[DirNode]) -> String {
             }
         }
         ZoomLevel::File => {
-            // Terminal level — suggest scs lookup
-            format!(
-                "//\n// [zoom: file] Use 'scs lookup <symbol>' for full definition"
-            )
+            "//\n// [zoom: file] Use 'scs lookup <symbol>' for full definition".to_string()
         }
     }
 }
@@ -372,9 +369,7 @@ pub fn build_hierarchy(index: &Index, root_path: &str) -> Vec<DirNode> {
 }
 
 fn get_summary(index: &Index, chunk: &crate::Chunk) -> Option<String> {
-    // Prefer LLM summary over doc summary
-    chunk.llm_summary_idx
-        .or(chunk.doc_summary_idx)
+    chunk.doc_summary_idx
         .and_then(|idx| index.strings.get(idx))
         .map(|s| s.to_string())
 }
@@ -819,7 +814,6 @@ pub fn attach_tree_summaries(
 /// Use this when summaries have been attached externally.
 pub fn generate_map_from_dirs(
     dirs: Vec<DirNode>,
-    _index: &Index,
     root_path: &str,
     config: &MapConfig,
 ) -> String {
@@ -893,7 +887,7 @@ pub fn generate_map(index: &Index, root_path: &str, config: &MapConfig) -> Strin
     }
 }
 
-fn count_languages(dirs: &[DirNode]) -> Vec<(SourceLang, usize)> {
+pub fn count_languages(dirs: &[DirNode]) -> Vec<(SourceLang, usize)> {
     let mut counts: BTreeMap<u8, (SourceLang, usize)> = BTreeMap::new();
     for dir in dirs {
         for file in &dir.files {
@@ -1018,7 +1012,7 @@ fn render_other_dirs_summary(out: &mut String, dirs: &[&DirNode]) {
         return;
     }
 
-    let mut sorted: Vec<&&DirNode> = dirs.iter().collect();
+    let mut sorted: Vec<&DirNode> = dirs.to_vec();
     sorted.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
 
     let show_count = 5;
@@ -1303,7 +1297,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: Some(parse_sig),
                 doc_summary_idx: Some(parse_doc),
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             },
             // parser/code.rs: extract_symbols (private fn)
@@ -1318,7 +1311,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: None,
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Private,
             },
             // parser/code.rs: CodeParser (struct)
@@ -1333,7 +1325,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: None,
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             },
             // parser/code.rs: new (method of CodeParser)
@@ -1348,7 +1339,6 @@ mod tests {
                 context_idx: Some(context_str),
                 signature_idx: None,
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             },
             // lib.rs: load_or_create (public fn)
@@ -1363,7 +1353,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: Some(main_fn_sig),
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             },
             // parser/docs.rs: parse_markdown
@@ -1378,7 +1367,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: None,
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             },
         ];
@@ -1715,7 +1703,6 @@ mod tests {
                 context_idx: None,
                 signature_idx: None,
                 doc_summary_idx: None,
-                llm_summary_idx: None,
                 visibility: Visibility::Public,
             });
 
@@ -1826,7 +1813,7 @@ mod tests {
         }
 
         let config = MapConfig { max_tokens: 2000, area: None };
-        let output = generate_map_from_dirs(dirs, &index, "/project", &config);
+        let output = generate_map_from_dirs(dirs, "/project", &config);
 
         // Directory summary should appear in parentheses
         assert!(output.contains("(Code and doc parsing)"), "Dir summary missing: {}", output);
@@ -1843,7 +1830,7 @@ mod tests {
         // when no summaries are attached
         let output1 = generate_map(&index, "/project", &config);
         let dirs = build_hierarchy(&index, "/project");
-        let output2 = generate_map_from_dirs(dirs, &index, "/project", &config);
+        let output2 = generate_map_from_dirs(dirs, "/project", &config);
 
         assert_eq!(output1, output2);
     }

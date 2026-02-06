@@ -1,14 +1,16 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 pub mod index;
 pub mod embeddings;
 pub mod map;
 pub mod parser;
 pub mod search;
+pub mod summarizer;
 
 // Global quiet mode flag
 static QUIET_MODE: AtomicBool = AtomicBool::new(false);
@@ -337,7 +339,6 @@ pub struct RawChunk {
 // SCS - Main orchestration struct
 // ============================================================================
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -807,11 +808,6 @@ impl SCS {
         search::lookup::lookup(&self.index.index, &self.index.name_to_chunks, name, filter)
     }
 
-    /// Generate an outline of a file's structure.
-    pub fn outline(&self, file: &Path) -> Value {
-        search::lookup::outline(&self.index.index, file)
-    }
-
     /// Get the current status of the index.
     pub fn status(&self) -> Value {
         let embedding_count = self.index.embeddings.len();
@@ -920,6 +916,455 @@ impl SCS {
             Ok(batch)
         } else {
             anyhow::bail!("OPENAI_API_KEY not set")
+        }
+    }
+
+    // ========================================================================
+    // Map Summary Methods
+    // ========================================================================
+
+    fn load_summary_cache(&self) -> summarizer::SummaryCache {
+        let cache_path = self.index.index_dir.join("summaries.json");
+        summarizer::SummaryCache::load(&cache_path)
+            .unwrap_or_else(|_| summarizer::SummaryCache::new())
+    }
+
+    fn save_summary_cache(&self, cache: &summarizer::SummaryCache) {
+        let cache_path = self.index.index_dir.join("summaries.json");
+        if let Err(e) = cache.save(&cache_path) {
+            warn!("[scs] Warning: Failed to save summary cache: {}", e);
+        }
+    }
+
+    fn collect_needed_dir_file_summaries(
+        dirs: &[map::DirNode],
+        cache: &summarizer::SummaryCache,
+    ) -> Vec<summarizer::gemini::MapSummaryInput> {
+        let mut needed = Vec::new();
+
+        for dir in dirs {
+            let dir_key = format!("dir::{}", dir.path);
+            let dir_hash = map::dir_content_hash(dir);
+            if cache.get(&dir_key, &dir_hash, "").is_none() {
+                let symbols: Vec<String> = dir.files.iter()
+                    .flat_map(|f| f.symbols.iter().map(|s| s.name.clone()))
+                    .collect();
+                needed.push(summarizer::gemini::MapSummaryInput {
+                    path: dir.path.clone(),
+                    kind: "directory",
+                    symbols,
+                });
+            }
+
+            for file in &dir.files {
+                let file_key = format!("file::{}:{}", dir.path, file.name);
+                let file_hash = map::file_content_hash(file);
+                if cache.get(&file_key, &file_hash, "").is_none() {
+                    let symbols: Vec<String> = file.symbols.iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    needed.push(summarizer::gemini::MapSummaryInput {
+                        path: format!("{}/{}", dir.path, file.name),
+                        kind: "file",
+                        symbols,
+                    });
+                }
+            }
+        }
+
+        needed
+    }
+
+    fn cache_dir_file_batch_result(
+        batch: &[summarizer::gemini::MapSummaryInput],
+        result: &summarizer::gemini::MapBatchResult,
+        dirs: &[map::DirNode],
+        cache: &mut summarizer::SummaryCache,
+    ) {
+        for (path, summary) in &result.summaries {
+            let is_dir = batch.iter().any(|e| e.path == *path && e.kind == "directory");
+            if is_dir {
+                let dir_key = format!("dir::{}", path);
+                if let Some(dir) = dirs.iter().find(|d| d.path == *path) {
+                    let dir_hash = map::dir_content_hash(dir);
+                    cache.insert(dir_key, dir_hash, String::new(), summary.clone());
+                }
+            } else {
+                let dir_path = map::extract_dir_path(path);
+                let file_name = path.rsplit('/').next().unwrap_or(path);
+                let file_key = format!("file::{}:{}", dir_path, file_name);
+                if let Some(dir) = dirs.iter().find(|d| d.path == dir_path) {
+                    if let Some(file) = dir.files.iter().find(|f| f.name == file_name) {
+                        let file_hash = map::file_content_hash(file);
+                        cache.insert(file_key, file_hash, String::new(), summary.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_dir_file_summaries(dirs: &mut [map::DirNode], cache: &summarizer::SummaryCache) {
+        for dir in dirs.iter_mut() {
+            let dir_key = format!("dir::{}", dir.path);
+            let dir_hash = map::dir_content_hash(dir);
+            if let Some(summary) = cache.get(&dir_key, &dir_hash, "") {
+                dir.summary = Some(summary.to_string());
+            }
+
+            for file in &mut dir.files {
+                let file_key = format!("file::{}:{}", dir.path, file.name);
+                let file_hash = map::file_content_hash(file);
+                if let Some(summary) = cache.get(&file_key, &file_hash, "") {
+                    file.summary = Some(summary.to_string());
+                }
+            }
+        }
+    }
+
+    /// Generate LLM summaries for directories and files in flat map mode.
+    pub async fn ensure_map_summaries(&mut self, dirs: &mut [map::DirNode]) -> Result<()> {
+        let mut cache = self.load_summary_cache();
+        let needed = Self::collect_needed_dir_file_summaries(dirs, &cache);
+
+        if !needed.is_empty() {
+            match summarizer::gemini::GeminiClient::from_env() {
+                Ok(client) => {
+                    for batch in needed.chunks(50) {
+                        match client.summarize_map_batch(batch).await {
+                            Ok(result) => {
+                                Self::cache_dir_file_batch_result(batch, &result, dirs, &mut cache);
+                            }
+                            Err(e) => warn!("[scs] Warning: Map summary batch failed: {}", e),
+                        }
+                    }
+                    self.save_summary_cache(&cache);
+                }
+                Err(e) => warn!("[scs] Warning: Gemini client not available: {}", e),
+            }
+        }
+
+        Self::apply_dir_file_summaries(dirs, &cache);
+        Ok(())
+    }
+
+    /// Generate LLM summaries for collapsed tree nodes in large project mode.
+    pub async fn ensure_tree_summaries(
+        &mut self,
+        trees: &mut [map::DirTree],
+        dirs: &[map::DirNode],
+    ) -> Result<()> {
+        let mut cache = self.load_summary_cache();
+        let tree_nodes = map::collect_tree_nodes_with_paths(trees, "");
+
+        let mut needed: Vec<summarizer::gemini::MapSummaryInput> = Vec::new();
+        for (path, _files, _symbols) in &tree_nodes {
+            let tree_key = format!("tree::{}", path);
+            let tree_hash = map::tree_content_hash(path, dirs);
+            if cache.get(&tree_key, &tree_hash, "").is_none() {
+                let symbols = map::collect_tree_symbol_names(path, dirs, 30);
+                needed.push(summarizer::gemini::MapSummaryInput {
+                    path: path.clone(),
+                    kind: "directory",
+                    symbols,
+                });
+            }
+        }
+
+        if !needed.is_empty() {
+            match summarizer::gemini::GeminiClient::from_env() {
+                Ok(client) => {
+                    for batch in needed.chunks(50) {
+                        match client.summarize_map_batch(batch).await {
+                            Ok(result) => {
+                                for (path, summary) in &result.summaries {
+                                    let tree_key = format!("tree::{}", path);
+                                    let tree_hash = map::tree_content_hash(path, dirs);
+                                    cache.insert(tree_key, tree_hash, String::new(), summary.clone());
+                                }
+                            }
+                            Err(e) => warn!("[scs] Warning: Tree summary batch failed: {}", e),
+                        }
+                    }
+                    self.save_summary_cache(&cache);
+                }
+                Err(e) => warn!("[scs] Warning: Gemini client not available: {}", e),
+            }
+        }
+
+        let mut summary_map: HashMap<String, String> = HashMap::new();
+        for (path, _, _) in &tree_nodes {
+            let tree_key = format!("tree::{}", path);
+            let tree_hash = map::tree_content_hash(path, dirs);
+            if let Some(summary) = cache.get(&tree_key, &tree_hash, "") {
+                summary_map.insert(path.clone(), summary.to_string());
+            }
+        }
+        map::attach_tree_summaries(trees, &summary_map, "");
+
+        Ok(())
+    }
+
+    /// Generate LLM summaries scoped to a specific area (directory or file).
+    pub async fn ensure_area_summaries(
+        &mut self,
+        dirs: &mut [map::DirNode],
+        area: &str,
+    ) -> Result<()> {
+        let mut cache = self.load_summary_cache();
+
+        let area_norm = area.trim_end_matches('/');
+        let area_dir = map::extract_dir_path(area_norm);
+
+        // Filter dirs to area scope, then collect needed entries
+        let area_dirs: Vec<map::DirNode> = dirs.iter()
+            .filter(|dir| {
+                dir.path == area_norm
+                    || dir.path.starts_with(&format!("{}/", area_norm))
+                    || dir.path == area_dir
+            })
+            .cloned()
+            .collect();
+
+        let needed = Self::collect_needed_dir_file_summaries(&area_dirs, &cache);
+
+        if !needed.is_empty() {
+            match summarizer::gemini::GeminiClient::from_env() {
+                Ok(client) => {
+                    for batch in needed.chunks(50) {
+                        match client.summarize_map_batch(batch).await {
+                            Ok(result) => {
+                                Self::cache_dir_file_batch_result(batch, &result, dirs, &mut cache);
+                            }
+                            Err(e) => warn!("[scs] Warning: Area summary batch failed: {}", e),
+                        }
+                    }
+                    self.save_summary_cache(&cache);
+                }
+                Err(e) => warn!("[scs] Warning: Gemini client not available: {}", e),
+            }
+        }
+
+        Self::apply_dir_file_summaries(dirs, &cache);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Function Summary Methods
+    // ========================================================================
+
+    /// Generate function-level LLM summaries using dependency-ordered batch processing.
+    /// Uses CallGraph levels to summarize leaf functions first, then inject their
+    /// summaries as context when summarizing callers.
+    pub async fn generate_summaries(
+        &mut self,
+        batch_size: usize,
+        force: bool,
+    ) -> Result<summarizer::SummaryStats> {
+        use sha2::{Sha256, Digest};
+
+        let mut cache = if force {
+            summarizer::SummaryCache::new()
+        } else {
+            self.load_summary_cache()
+        };
+
+        let mut stats = summarizer::SummaryStats::new();
+
+        // Build call graph from index chunks
+        let mut call_graph = summarizer::levels::CallGraph::new();
+        let mut chunk_bodies: HashMap<String, (usize, String)> = HashMap::new(); // name -> (chunk_idx, body)
+
+        for (idx, chunk) in self.index.index.chunks.iter().enumerate() {
+            if chunk.chunk_type != ChunkType::Code {
+                continue;
+            }
+            match chunk.kind {
+                ChunkKind::Function | ChunkKind::Method => {}
+                _ => continue,
+            }
+
+            let name = self.index.index.strings.get(chunk.name_idx).unwrap_or("").to_string();
+            let body = self.index.index.strings.get(chunk.content_idx).unwrap_or("").to_string();
+
+            call_graph.add_function(&name);
+            chunk_bodies.insert(name.clone(), (idx, body));
+
+            // Extract calls from body (simple heuristic: match known function names)
+            let content = self.index.index.strings.get(chunk.content_idx).unwrap_or("");
+            for (other_idx, other_chunk) in self.index.index.chunks.iter().enumerate() {
+                if other_idx == idx { continue; }
+                if other_chunk.chunk_type != ChunkType::Code { continue; }
+                match other_chunk.kind {
+                    ChunkKind::Function | ChunkKind::Method => {}
+                    _ => continue,
+                }
+                let other_name = self.index.index.strings.get(other_chunk.name_idx).unwrap_or("");
+                if !other_name.is_empty() && content.contains(other_name) {
+                    call_graph.add_call(&name, other_name);
+                }
+            }
+        }
+
+        let levels = call_graph.compute_levels();
+        stats.total_functions = chunk_bodies.len();
+        stats.levels = levels.len();
+
+        // Create Gemini client
+        let client = match summarizer::gemini::GeminiClient::from_env() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("[scs] Warning: Gemini client not available: {}", e);
+                return Ok(stats);
+            }
+        };
+
+        // Track generated summaries for context injection
+        let mut generated_summaries: HashMap<String, String> = HashMap::new();
+
+        // Process each level in dependency order
+        for level_funcs in &levels {
+            let mut batch_inputs: Vec<summarizer::gemini::FunctionInput> = Vec::new();
+
+            for func_name in level_funcs {
+                let (chunk_idx, body) = match chunk_bodies.get(func_name) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                };
+
+                let body_hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+
+                // Build context hash from callee summaries
+                let callees = call_graph.get_calls(func_name);
+                let mut callee_summaries_sorted: Vec<String> = callees.iter()
+                    .filter_map(|c| generated_summaries.get(c))
+                    .cloned()
+                    .collect();
+                callee_summaries_sorted.sort();
+                let context_hash = format!("{:x}", Sha256::digest(callee_summaries_sorted.join("|").as_bytes()));
+
+                // Check cache
+                if cache.get(func_name, &body_hash, &context_hash).is_some() {
+                    stats.cached += 1;
+                    // Use cached summary for context in later levels
+                    if let Some(entry) = cache.entries.get(func_name) {
+                        generated_summaries.insert(func_name.clone(), entry.summary.clone());
+                    }
+                    continue;
+                }
+
+                // Build callee context map
+                let mut calls: HashMap<String, String> = HashMap::new();
+                for callee in callees {
+                    if let Some(summary) = generated_summaries.get(callee) {
+                        calls.insert(callee.clone(), summary.clone());
+                    }
+                }
+
+                batch_inputs.push(summarizer::gemini::FunctionInput {
+                    chunk_idx,
+                    name: func_name.clone(),
+                    body,
+                    calls,
+                });
+            }
+
+            // Process batch_inputs in batch_size chunks
+            for batch in batch_inputs.chunks(batch_size) {
+                if batch.is_empty() { continue; }
+
+                stats.api_calls += 1;
+                match client.summarize_batch(batch).await {
+                    Ok(result) => {
+                        stats.input_tokens += result.input_tokens;
+                        stats.output_tokens += result.output_tokens;
+
+                        for (_, summary) in &result.summaries {
+                            // Find the matching function input
+                            if let Some(input) = batch.iter().find(|i| {
+                                result.summaries.iter().any(|(ci, s)| *ci == i.chunk_idx && s == summary)
+                            }) {
+                                let body_hash = format!("{:x}", Sha256::digest(input.body.as_bytes()));
+                                let callees = call_graph.get_calls(&input.name);
+                                let mut callee_summaries_sorted: Vec<String> = callees.iter()
+                                    .filter_map(|c| generated_summaries.get(c))
+                                    .cloned()
+                                    .collect();
+                                callee_summaries_sorted.sort();
+                                let context_hash = format!("{:x}", Sha256::digest(callee_summaries_sorted.join("|").as_bytes()));
+
+                                cache.insert(
+                                    input.name.clone(),
+                                    body_hash,
+                                    context_hash,
+                                    summary.clone(),
+                                );
+                                generated_summaries.insert(input.name.clone(), summary.clone());
+                                stats.summarized += 1;
+                            }
+                        }
+
+                        // Track failures (inputs not in results)
+                        let result_indices: HashSet<usize> =
+                            result.summaries.iter().map(|(ci, _)| *ci).collect();
+                        for input in batch {
+                            if !result_indices.contains(&input.chunk_idx) {
+                                stats.failed += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[scs] Warning: Summary batch failed: {}", e);
+                        stats.failed += batch.len();
+                    }
+                }
+            }
+        }
+
+        self.save_summary_cache(&cache);
+
+        Ok(stats)
+    }
+
+    /// Returns summary stats without actually generating summaries (dry run).
+    pub fn summarize_dry_run(&self) -> summarizer::SummaryStats {
+        let mut call_graph = summarizer::levels::CallGraph::new();
+        let mut func_count = 0usize;
+
+        for (idx, chunk) in self.index.index.chunks.iter().enumerate() {
+            if chunk.chunk_type != ChunkType::Code {
+                continue;
+            }
+            match chunk.kind {
+                ChunkKind::Function | ChunkKind::Method => {}
+                _ => continue,
+            }
+
+            let name = self.index.index.strings.get(chunk.name_idx).unwrap_or("");
+            call_graph.add_function(name);
+            func_count += 1;
+
+            // Extract calls from body
+            let content = self.index.index.strings.get(chunk.content_idx).unwrap_or("");
+            for (other_idx, other_chunk) in self.index.index.chunks.iter().enumerate() {
+                if other_idx == idx { continue; }
+                if other_chunk.chunk_type != ChunkType::Code { continue; }
+                match other_chunk.kind {
+                    ChunkKind::Function | ChunkKind::Method => {}
+                    _ => continue,
+                }
+                let other_name = self.index.index.strings.get(other_chunk.name_idx).unwrap_or("");
+                if !other_name.is_empty() && content.contains(other_name) {
+                    call_graph.add_call(name, other_name);
+                }
+            }
+        }
+
+        let levels = call_graph.compute_levels();
+
+        summarizer::SummaryStats {
+            total_functions: func_count,
+            levels: levels.len(),
+            ..Default::default()
         }
     }
 

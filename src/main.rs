@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
                 }
 
                 let config = map::MapConfig { max_tokens, area };
-                let output = map::generate_map_from_dirs(dirs, &scs.index.index, &root_str, &config);
+                let output = map::generate_map_from_dirs(dirs, &root_str, &config);
 
                 if output.is_empty() {
                     eprintln!("[scs] No code symbols found in index");
@@ -302,15 +302,9 @@ async fn main() -> Result<()> {
                         .and_then(|n| n.to_str())
                         .unwrap_or("project");
 
-                    let lang_counts = dirs.iter()
-                        .flat_map(|d| &d.files)
-                        .fold(std::collections::HashMap::new(), |mut m, f| {
-                            *m.entry(f.lang).or_insert(0usize) += f.symbols.iter().map(|s| 1 + s.members.len()).sum::<usize>();
-                            m
-                        });
-                    let primary_lang = lang_counts.into_iter()
-                        .max_by_key(|(_, c)| *c)
-                        .map(|(l, _)| l)
+                    let primary_lang = map::count_languages(&dirs)
+                        .first()
+                        .map(|(l, _)| *l)
                         .unwrap_or(map::SourceLang::Other);
                     let total_symbols: usize = dirs.iter().map(|d| d.symbol_count).sum();
 
@@ -326,7 +320,7 @@ async fn main() -> Result<()> {
                     }
 
                     let config = map::MapConfig { max_tokens, area: None };
-                    let output = map::generate_map_from_dirs(dirs, &scs.index.index, &root_str, &config);
+                    let output = map::generate_map_from_dirs(dirs, &root_str, &config);
 
                     if output.is_empty() {
                         eprintln!("[scs] No code symbols found in index");
@@ -372,8 +366,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Detect if the project is primarily Rust or TypeScript/JavaScript
-/// Parse filter string to ChunkType
 fn parse_filter(filter: &Option<String>) -> Result<Option<ChunkType>> {
     match filter {
         None => Ok(None),
