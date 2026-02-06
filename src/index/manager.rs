@@ -12,9 +12,12 @@ use walkdir::WalkDir;
 use crate::{ChunkType, Index};
 use super::cache::{compute_hash, get_mtime};
 
-/// Index format version
-#[allow(dead_code)]
-const VERSION: u32 = 2;
+/// Index format version - increment when Index struct changes
+/// v3: Added llm_summary_idx to Chunk
+const FORMAT_VERSION: u32 = 3;
+
+/// Magic bytes for index file validation
+const MAGIC: &[u8; 4] = b"SCS\x01";
 
 /// Embedding model identifier
 const EMBEDDING_MODEL: &str = "text-embedding-3-small";
@@ -73,42 +76,74 @@ impl IndexManager {
         let embeddings_bin = index_dir.join("embeddings.bin");
 
         if index_bin.exists() {
-            // Load existing index
-            let file = File::open(&index_bin).context("Failed to open index.bin")?;
-            let reader = BufReader::new(file);
-            let mut index: Index = bincode::deserialize_from(reader)
-                .context("Failed to deserialize index.bin")?;
+            // Load existing index with format validation
+            match Self::load_index_with_validation(&index_bin) {
+                Ok(mut index) => {
+                    // Rebuild string index for lookups
+                    index.strings.rebuild_index();
 
-            // Rebuild string index for lookups
-            index.strings.rebuild_index();
+                    // Load embeddings
+                    let embeddings = Self::load_embeddings(&embeddings_bin, index.chunks.len())?;
 
-            // Load embeddings
-            let embeddings = Self::load_embeddings(&embeddings_bin, index.chunks.len())?;
-
-            let mut manager = Self {
-                root,
-                index_dir,
-                index,
-                embeddings,
-                name_to_chunks: HashMap::new(),
-                file_to_entry: HashMap::new(),
-            };
-            manager.build_runtime_caches();
-            Ok(manager)
-        } else {
-            // Create new empty index
-            let root_str = root.to_string_lossy();
-            let index = Index::new(&root_str, EMBEDDING_MODEL);
-
-            Ok(Self {
-                root,
-                index_dir,
-                index,
-                embeddings: Vec::new(),
-                name_to_chunks: HashMap::new(),
-                file_to_entry: HashMap::new(),
-            })
+                    let mut manager = Self {
+                        root,
+                        index_dir,
+                        index,
+                        embeddings,
+                        name_to_chunks: HashMap::new(),
+                        file_to_entry: HashMap::new(),
+                    };
+                    manager.build_runtime_caches();
+                    return Ok(manager);
+                }
+                Err(e) => {
+                    // Format mismatch or corruption - delete and recreate
+                    eprintln!("[scs] Cache invalid ({}), recreating...", e);
+                    fs::remove_file(&index_bin).ok();
+                    fs::remove_file(&embeddings_bin).ok();
+                }
+            }
         }
+
+        // Create new empty index
+        let root_str = root.to_string_lossy();
+        let index = Index::new(&root_str, EMBEDDING_MODEL);
+
+        Ok(Self {
+            root,
+            index_dir,
+            index,
+            embeddings: Vec::new(),
+            name_to_chunks: HashMap::new(),
+            file_to_entry: HashMap::new(),
+        })
+    }
+
+    /// Load index with format validation (magic + version check)
+    fn load_index_with_validation(path: &Path) -> Result<Index> {
+        let mut file = File::open(path).context("Failed to open index.bin")?;
+
+        // Read and validate magic bytes
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).context("Failed to read magic bytes")?;
+        if &magic != MAGIC {
+            anyhow::bail!("invalid magic bytes");
+        }
+
+        // Read and validate version
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes).context("Failed to read version")?;
+        let version = u32::from_le_bytes(version_bytes);
+        if version != FORMAT_VERSION {
+            anyhow::bail!("version mismatch: file={}, expected={}", version, FORMAT_VERSION);
+        }
+
+        // Deserialize the rest
+        let reader = BufReader::new(file);
+        let index: Index = bincode::deserialize_from(reader)
+            .context("Failed to deserialize index")?;
+
+        Ok(index)
     }
 
     /// Build runtime lookup caches from index data.
@@ -217,11 +252,16 @@ impl IndexManager {
 
         fs::create_dir_all(&staging_dir).context("Failed to create staging directory")?;
 
-        // Write index.bin (bincode)
+        // Write index.bin (header + bincode)
         {
             let path = staging_dir.join("index.bin");
             let file = File::create(&path).context("Failed to create index.bin")?;
             let mut writer = BufWriter::new(&file);
+
+            // Write header: magic + version
+            writer.write_all(MAGIC).context("Failed to write magic bytes")?;
+            writer.write_all(&FORMAT_VERSION.to_le_bytes()).context("Failed to write version")?;
+
             bincode::serialize_into(&mut writer, &self.index)
                 .context("Failed to serialize index")?;
             writer.flush().context("Failed to flush index.bin")?;
@@ -555,7 +595,7 @@ mod tests {
         let manager = IndexManager::load_or_create(temp_dir.path()).unwrap();
 
         assert!(manager.index_dir.exists());
-        assert_eq!(manager.index.version, VERSION);
+        assert_eq!(manager.index.version, FORMAT_VERSION);
         assert!(manager.index.chunks.is_empty());
         assert!(manager.index.files.is_empty());
     }

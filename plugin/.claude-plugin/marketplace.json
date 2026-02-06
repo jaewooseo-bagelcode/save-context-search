@@ -12,8 +12,8 @@
     {
       "name": "scs",
       "source": "./",
-      "description": "Context-efficient semantic search for code. Reduces token usage by 90%+.",
-      "version": "0.1.0",
+      "description": "Project map, semantic search, and symbol lookup for code. Reduces token usage by 90%+.",
+      "version": "0.2.0",
       "author": {
         "name": "Jaewoo Seo"
       },

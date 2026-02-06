@@ -1,207 +1,175 @@
 # SCS (Save Context Search)
 
-Context-efficient semantic search CLI for Claude Code that reduces token consumption by **90%+** when exploring codebases.
+Claude Code 플러그인 — 프로젝트 맵, 의미 검색, 심볼 룩업으로 코드 탐색 토큰을 **90%+** 절감.
 
 ## Why SCS?
 
-Traditional codebase exploration in Claude Code:
+기존 Claude Code 코드 탐색:
 ```
 glob **/*.rs → grep "symbol" → read files → ~9,200 tokens
 ```
 
-With SCS:
+SCS:
 ```
-scs lookup "symbol" → ~950 tokens
+scs map → scs lookup "symbol" → read lines → ~950 tokens
 ```
-
-SCS replaces the glob→grep→read workflow with intelligent symbol extraction and semantic search.
 
 ## Features
 
-- **Semantic Search** - Find code by meaning, not just text matching
-- **Symbol Lookup** - Exact symbol definitions with confidence levels
-- **File Outline** - View file structure without reading full content
-- **Incremental Indexing** - Only re-indexes changed files (mtime-based)
-- **Non-blocking Refresh** - Dirty flag mechanism for concurrent access
-- **Claude Code Plugin** - Auto-refresh hooks and Grep/Glob interception
+- **Project Map** — 프로젝트 구조를 LLM 요약과 함께 한눈에 파악. 디렉토리/파일 단위 줌인 지원
+- **Semantic Search** — 임베딩 기반 의미 검색으로 이름을 모르는 코드도 찾기
+- **Symbol Lookup** — 정확한 심볼 위치(file:line) + 시그니처 반환
+- **Incremental Indexing** — mtime 기반 변경 파일만 재인덱싱
+- **Auto-refresh** — 매 프롬프트마다 인덱스 자동 갱신 (11ms~200ms)
 
 ## Installation
 
 ### Prerequisites
 
-- Rust toolchain (for building)
-- OpenAI API key (for semantic search embeddings)
+- Rust toolchain
+- `OPENAI_API_KEY` — 임베딩 생성
+- `GEMINI_API_KEY` — LLM 요약 (map 기능)
 
-### Build
+### Build & Install
 
 ```bash
 git clone https://github.com/jaewooseo/save-context-search.git
 cd save-context-search
-./build-plugin.sh
+cargo build --release
+cp target/release/scs plugin/bin/scs
 ```
 
-### Install as Claude Code Plugin
+### Claude Code Plugin 등록
 
-The plugin is located in `./plugin` directory after building.
-
-**Option 1: Use --plugin-dir (for testing)**
 ```bash
+# Option 1: 직접 지정
 claude --plugin-dir ./plugin
-```
 
-**Option 2: Add to local marketplace**
-
-Create `~/.claude-plugin/marketplace.json`:
-```json
-{
-  "name": "local",
-  "owner": { "name": "Your Name", "email": "you@email.com" },
-  "metadata": { "description": "Local plugins", "version": "1.0.0" },
-  "plugins": [
-    {
-      "name": "scs",
-      "source": "/path/to/save-context-search/plugin",
-      "description": "Context-efficient semantic search"
-    }
-  ]
-}
-```
-
-Then enable via `/plugin` in Claude Code.
-
-### Environment Variables
-
-```bash
-export OPENAI_API_KEY=sk-...  # Required for semantic search
+# Option 2: /plugins 명령으로 설치
 ```
 
 ## Usage
 
+### Agent Workflow
+
+세션 시작 시 프로젝트 맵이 자동 주입됩니다:
+
+```
+① Orient   — 맵으로 프로젝트 구조 파악 (자동)
+② Navigate — scs map --area <dir>  → 관심 모듈로 줌인
+③ Locate   — scs lookup <name>     → 정확한 위치
+             scs search <concept>  → 의미 검색
+④ Read     — Read file:L1-L2       → 필요한 줄만
+```
+
 ### Commands
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `scs search` | Semantic search | `scs search "user authentication"` |
-| `scs lookup` | Symbol lookup | `scs lookup "PlayerController"` |
-| `scs outline` | File structure | `scs outline src/main.rs` |
-| `scs status` | Index health | `scs status` |
-| `scs refresh` | Incremental update | `scs refresh` |
-| `scs embed` | Generate embeddings | `scs embed` |
-| `scs reindex` | Full rebuild | `scs reindex` |
+#### map — 프로젝트 맵 + 줌인
 
-### Search
+```bash
+scs map                          # 전체 프로젝트 구조
+scs map --area src/parser        # 디렉토리 줌인: 파일 + 요약
+scs map --area src/parser/code.rs  # 파일 줌인: 함수 + 시그니처
+```
 
-Find code by meaning:
+출력 예시:
+```
+// Project: my-project (Rust, 367 symbols)
+// src/parser/  — 3 files, 15 symbols (Code and doc parsing)
+//   code.rs  — 8 — Parses source code via tree-sitter
+//   docs.rs  — 5 — Document format parsing
+```
+
+#### search — 의미 검색
 
 ```bash
 scs search "handle user login"
-scs search "error handling retry" --top 10
+scs search "error handling" --top 10
 scs search "database connection" --filter code
 ```
 
-### Lookup
-
-Find exact symbol definitions:
+#### lookup — 심볼 위치
 
 ```bash
 scs lookup "PlayerController"
-scs lookup "Player.Update"  # Qualified name for disambiguation
+scs lookup "Player.Update"       # ClassName.Method으로 동명 구분
 ```
 
-### Outline
-
-View file structure without reading content:
+#### Maintenance
 
 ```bash
-scs outline src/main.rs
+scs refresh          # 증분 갱신 (자동 실행됨)
+scs reindex          # 전체 재인덱싱
+scs embed            # 임베딩 생성
+scs summarize        # 함수 LLM 요약 생성
+scs status           # 인덱스 상태
 ```
 
-## Plugin Features
-
-When installed as a Claude Code plugin, SCS provides:
-
-### Auto-Refresh Hooks
-
-- **SessionStart** - Index refreshes when Claude Code starts
-- **UserPromptSubmit** - Index refreshes before each prompt
-
-### Grep/Glob Interception
-
-PreToolUse hook suggests SCS before using Grep or Glob:
+## Plugin Architecture
 
 ```
-"Before using Grep or Glob for code exploration, consider if SCS would be more efficient..."
+plugin/
+├── .claude-plugin/
+│   ├── plugin.json          # 매니페스트 (v0.2.0)
+│   └── marketplace.json     # 마켓플레이스 등록
+├── bin/scs                  # 번들 바이너리
+└── hooks/
+    ├── hooks.json           # SessionStart + UserPromptSubmit
+    └── session-start.sh     # refresh + map + workflow 주입
 ```
+
+### Hooks
+
+| Event | 동작 | 시간 |
+|-------|------|------|
+| **SessionStart** | `refresh` + `map` + workflow 가이드 주입 | ~800ms |
+| **UserPromptSubmit** | `refresh --quiet` (인덱스 갱신) | 11~200ms |
 
 ## Supported Languages
 
-**Code** (via tree-sitter):
-- Rust (.rs)
-- TypeScript/TSX (.ts, .tsx)
-- JavaScript/JSX (.js, .jsx)
-- Python (.py)
-- C# (.cs)
+**Code** (tree-sitter): Rust, TypeScript/TSX, JavaScript/JSX, Python, C#
 
-**Documentation**:
-- Markdown (.md, .mdx)
-- Plain text (.txt)
-
-## Architecture
-
-```
-save-context-search/
-├── src/
-│   ├── main.rs              # CLI entry
-│   ├── lib.rs               # Core logic + SCS struct
-│   ├── index/manager.rs     # Incremental indexing
-│   ├── parser/              # tree-sitter + markdown parsing
-│   ├── embeddings/          # OpenAI API client
-│   └── search/              # Semantic + lookup search
-└── plugin/
-    ├── .claude-plugin/
-    │   ├── plugin.json      # Plugin manifest
-    │   └── marketplace.json # For local marketplace
-    ├── bin/scs              # Bundled binary
-    ├── hooks/hooks.json     # Auto-refresh + PreToolUse
-    └── skills/scs/          # Skill definition
-```
+**Docs**: Markdown, JSON, YAML, TOML, XML, Plain text
 
 ## How It Works
 
-1. **Indexing** - Parses code with tree-sitter, extracts symbols (functions, classes, methods)
-2. **Embedding** - Generates OpenAI text-embedding-3-small vectors (1,536 dims)
-3. **Search** - Cosine similarity search via simsimd
-4. **Caching** - Stores index in `.scs/` directory with mtime-based invalidation
+1. **Parse** — tree-sitter로 코드 심볼 추출 (함수, 클래스, 메서드)
+2. **Index** — StringTable 인터닝 + bincode 직렬화 (`.scs/index.bin`)
+3. **Embed** — OpenAI text-embedding-3-small (1,536차원)
+4. **Summarize** — Gemini Flash로 dir/file/function 요약 생성
+5. **Map** — 계층 구조 렌더링 (소형: flat mode, 대형: tree mode + collapsing)
+6. **Search** — simsimd 코사인 유사도 검색
 
-## Token Efficiency
+## Performance
 
-| Operation | Traditional | SCS |
-|-----------|-------------|-----|
-| Find symbol definition | ~9,200 tokens | ~950 tokens |
-| Explore file structure | ~2,000 tokens | ~100 tokens |
-| Search implementations | ~15,000 tokens | ~1,500 tokens |
+| 프로젝트 | 심볼 수 | map 모드 | 첫 실행 | 캐시 |
+|---------|---------|---------|---------|------|
+| SCS | 367 | flat | 2.8s | 10ms |
+| RumiBot | 767 | flat | 3s | 10ms |
+| SyntaxOS | 1.7K | flat | 12s | 10ms |
+| upg-client | 49K | tree | 57s | 0.2s |
+| PBI | 32K | tree | 44s | 1.4s |
 
-## Configuration
+## Cache
 
-Index stored in `.scs/` directory:
-- `index.bin` - Indexed chunks and metadata
-- `embeddings.bin` - Vector embeddings
-- `lock` - Process lock file
-- `dirty` - Dirty flag for deferred refresh
+```
+.scs/
+├── index.bin        # 심볼 인덱스 (bincode)
+├── embeddings.bin   # 벡터 임베딩 (bincode)
+├── summaries.json   # LLM 요약 캐시
+├── lock             # 프로세스 락
+└── dirty            # 지연 갱신 플래그
+```
 
 ## Development
 
 ```bash
 cargo build           # Debug build
-cargo build --release # Release build
-cargo test            # Run tests
+cargo build --release # Release build (LTO + strip)
+cargo test            # 89 tests
 cargo clippy          # Lint
 ```
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.

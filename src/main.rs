@@ -1,7 +1,7 @@
 //! scs - Context-efficient semantic search CLI for code
 //!
 //! This CLI provides semantic search, symbol lookup, dependency tracking,
-//! and file outline functionality optimized for token-efficient codebase exploration.
+//! optimized for token-efficient codebase exploration.
 
 use std::path::PathBuf;
 
@@ -50,12 +50,6 @@ enum Commands {
         filter: Option<String>,
     },
 
-    /// Show file structure (symbols and sections)
-    Outline {
-        /// File path
-        file: PathBuf,
-    },
-
     /// Show index status
     Status,
 
@@ -90,13 +84,24 @@ enum Commands {
         #[arg(long, default_value = "2000")]
         max_tokens: usize,
 
-        /// Output format: auto, rust, typescript (or ts)
-        #[arg(long, default_value = "auto")]
-        format: String,
-
-        /// Include symbols without documentation
+        /// Focus on a specific directory or file (shows it at max depth)
         #[arg(long)]
-        include_undocumented: bool,
+        area: Option<String>,
+    },
+
+    /// Generate LLM summaries for functions
+    Summarize {
+        /// Batch size (functions per API call)
+        #[arg(long, short, default_value = "50")]
+        batch: usize,
+
+        /// Force regeneration (ignore cache)
+        #[arg(long)]
+        force: bool,
+
+        /// Dry run (show plan without API calls)
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -104,9 +109,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Determine project root
+    // Determine project root (canonicalize to absolute path for consistent matching)
     let root = match cli.path {
-        Some(p) => p,
+        Some(p) => std::fs::canonicalize(&p)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or(p)),
         None => std::env::current_dir().context("Failed to get current directory")?,
     };
 
@@ -157,25 +163,6 @@ async fn main() -> Result<()> {
 
             let filter_type = parse_filter(&filter)?;
             let results = scs.lookup(&name, filter_type);
-
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&results).context("Failed to serialize results")?
-            );
-        }
-
-        Commands::Outline { file } => {
-            // Outline doesn't need embeddings, try to refresh but use cache if locked
-            scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
-
-            // Make path absolute if relative
-            let abs_path = if file.is_absolute() {
-                file
-            } else {
-                root.join(&file)
-            };
-
-            let results = scs.outline(&abs_path);
 
             println!(
                 "{}",
@@ -256,39 +243,129 @@ async fn main() -> Result<()> {
             eprintln!("Generated {} embeddings", generated);
         }
 
-        Commands::Map { max_tokens, format, include_undocumented } => {
+        Commands::Map { max_tokens, area } => {
             // Ensure index is fresh (no embedding needed for map)
             scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
 
-            // Group chunks by module (now includes language info)
-            let modules = map::group_by_module(&scs.index.index, include_undocumented);
-
-            if modules.is_empty() {
-                eprintln!("[scs] No public documented symbols found. Try --include-undocumented");
+            if scs.index.index.chunks.is_empty() {
+                eprintln!("[scs] No symbols found in index");
                 return Ok(());
             }
 
-            // Get project name from root directory
-            let project_name = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("project");
+            let root_str = root.to_string_lossy().to_string();
+            let dirs = map::build_hierarchy(&scs.index.index, &root_str);
 
-            // Format output (mixed is default, separates by language)
-            let output = match format.to_lowercase().as_str() {
-                "rust" | "rs" => {
-                    map::format_rust_map(project_name, &modules, max_tokens)
-                }
-                "typescript" | "ts" => {
-                    map::format_typescript_map(project_name, &modules, max_tokens)
-                }
-                "auto" | "mixed" | _ => {
-                    // Default: language-separated sections
-                    map::format_mixed_map(project_name, &modules, max_tokens)
-                }
-            };
+            if let Some(ref area_str) = area {
+                // Zoom-in mode: --area specified
+                let zoom = map::detect_zoom_level(area_str, &dirs);
+                let mut dirs = dirs;
 
-            println!("{}", output);
+                match zoom {
+                    map::ZoomLevel::File | map::ZoomLevel::Directory => {
+                        // Generate summaries only for area-scoped dirs/files
+                        if let Err(e) = scs.ensure_area_summaries(&mut dirs, area_str).await {
+                            if !save_context_search::is_quiet() {
+                                eprintln!("[scs] Note: {}", e);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                let config = map::MapConfig { max_tokens, area };
+                let output = map::generate_map_from_dirs(dirs, &scs.index.index, &root_str, &config);
+
+                if output.is_empty() {
+                    eprintln!("[scs] No code symbols found in index");
+                } else {
+                    println!("{}", output);
+                }
+            } else {
+                // No --area: full project map
+                let use_tree = map::would_use_tree_mode(&dirs, max_tokens);
+
+                if use_tree {
+                    // Large project: tree mode with collapsed node summaries
+                    let mut trees = map::build_dir_tree(&dirs);
+                    for tree in &mut trees {
+                        map::collapse_single_children(tree);
+                    }
+
+                    if let Err(e) = scs.ensure_tree_summaries(&mut trees, &dirs).await {
+                        if !save_context_search::is_quiet() {
+                            eprintln!("[scs] Note: {}", e);
+                        }
+                    }
+
+                    let project_name = std::path::Path::new(&root_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("project");
+
+                    let lang_counts = dirs.iter()
+                        .flat_map(|d| &d.files)
+                        .fold(std::collections::HashMap::new(), |mut m, f| {
+                            *m.entry(f.lang).or_insert(0usize) += f.symbols.iter().map(|s| 1 + s.members.len()).sum::<usize>();
+                            m
+                        });
+                    let primary_lang = lang_counts.into_iter()
+                        .max_by_key(|(_, c)| *c)
+                        .map(|(l, _)| l)
+                        .unwrap_or(map::SourceLang::Other);
+                    let total_symbols: usize = dirs.iter().map(|d| d.symbol_count).sum();
+
+                    let output = map::render_tree_map(&trees, project_name, primary_lang, total_symbols, max_tokens);
+                    println!("{}", output);
+                } else {
+                    // Small/medium project: flat mode with dir/file summaries
+                    let mut dirs = dirs;
+                    if let Err(e) = scs.ensure_map_summaries(&mut dirs).await {
+                        if !save_context_search::is_quiet() {
+                            eprintln!("[scs] Note: {}", e);
+                        }
+                    }
+
+                    let config = map::MapConfig { max_tokens, area: None };
+                    let output = map::generate_map_from_dirs(dirs, &scs.index.index, &root_str, &config);
+
+                    if output.is_empty() {
+                        eprintln!("[scs] No code symbols found in index");
+                    } else {
+                        println!("{}", output);
+                    }
+                }
+            }
+        }
+
+        Commands::Summarize { batch, force, dry_run } => {
+            // Ensure index is fresh
+            scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
+
+            if dry_run {
+                let stats = scs.summarize_dry_run();
+                eprintln!("=== Summarize Dry Run ===");
+                eprintln!("Total functions: {}", stats.total_functions);
+                eprintln!("Levels: {}", stats.levels);
+                eprintln!("Batch size: {}", batch);
+                eprintln!("Estimated API calls: {}", (stats.total_functions + batch - 1) / batch);
+                eprintln!();
+                eprintln!("Run without --dry-run to generate summaries.");
+                return Ok(());
+            }
+
+            eprintln!("Generating LLM summaries (batch size: {})...", batch);
+            let stats = scs.generate_summaries(batch, force).await
+                .context("Failed to generate summaries")?;
+
+            eprintln!();
+            eprintln!("=== Summary Statistics ===");
+            eprintln!("Total functions: {}", stats.total_functions);
+            eprintln!("Cached (skipped): {}", stats.cached);
+            eprintln!("Summarized: {}", stats.summarized);
+            eprintln!("Failed: {}", stats.failed);
+            eprintln!("API calls: {}", stats.api_calls);
+            eprintln!("Input tokens: {}", stats.input_tokens);
+            eprintln!("Output tokens: {}", stats.output_tokens);
         }
     }
 

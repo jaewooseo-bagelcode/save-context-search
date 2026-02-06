@@ -1,9 +1,7 @@
-//! Lookup and outline functions for exact symbol resolution.
+//! Lookup functions for exact symbol resolution.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
-use serde_json::{json, Value};
+use std::path::PathBuf;
 
 use crate::{
     ChunkType, Confidence, Definition, Index,
@@ -130,73 +128,6 @@ pub fn lookup(
     }
 }
 
-/// Generate an outline of a file showing its structure.
-pub fn outline(index: &Index, file: &Path) -> Value {
-    let canonical_file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    let file_str = file.to_string_lossy();
-    let canonical_str = canonical_file.to_string_lossy();
-
-    // Find path_idx for this file
-    let path_idx = index.strings.find(&file_str)
-        .or_else(|| index.strings.find(&canonical_str));
-
-    let file_chunks: Vec<&crate::Chunk> = match path_idx {
-        Some(idx) => {
-            index.chunks.iter()
-                .filter(|c| c.file_idx == idx)
-                .collect()
-        }
-        None => {
-            // Fallback: search all chunks
-            index.chunks.iter()
-                .filter(|c| {
-                    if let Some(chunk_file) = index.strings.get(c.file_idx) {
-                        chunk_file == file_str || chunk_file == canonical_str
-                    } else {
-                        false
-                    }
-                })
-                .collect()
-        }
-    };
-
-    let mut symbols: Vec<Value> = Vec::new();
-    let mut sections: Vec<Value> = Vec::new();
-
-    for chunk in file_chunks {
-        let name = index.strings.get(chunk.name_idx).unwrap_or("unknown");
-        let entry = json!({
-            "name": name,
-            "kind": format!("{:?}", chunk.kind).to_lowercase(),
-            "line": chunk.line_start
-        });
-
-        match chunk.chunk_type {
-            ChunkType::Code => symbols.push(entry),
-            ChunkType::Doc => sections.push(entry),
-        }
-    }
-
-    // Sort by line number
-    symbols.sort_by(|a, b| {
-        let line_a = a.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-        let line_b = b.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-        line_a.cmp(&line_b)
-    });
-
-    sections.sort_by(|a, b| {
-        let line_a = a.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-        let line_b = b.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-        line_a.cmp(&line_b)
-    });
-
-    json!({
-        "file": file.display().to_string(),
-        "symbols": symbols,
-        "sections": sections
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +164,7 @@ mod tests {
             context_idx: None,
             signature_idx: None,
             doc_summary_idx: None,
+            llm_summary_idx: None,
             visibility: Visibility::Private,
         });
 
@@ -279,15 +211,4 @@ mod tests {
         assert_eq!(result.suggestions[0], "Symbol not found");
     }
 
-    #[test]
-    fn test_outline() {
-        let (index, _) = create_test_index();
-
-        let result = outline(&index, Path::new("/test/src/main.rs"));
-
-        assert_eq!(result["file"], "/test/src/main.rs");
-        let symbols = result["symbols"].as_array().unwrap();
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0]["name"], "test_function");
-    }
 }
