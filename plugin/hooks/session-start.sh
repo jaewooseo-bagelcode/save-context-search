@@ -2,9 +2,8 @@
 # SCS SessionStart: refresh index + inject project map + agent workflow
 SCS="${CLAUDE_PLUGIN_ROOT}/bin/scs"
 
-# Refresh index + generate embeddings (quiet)
+# Refresh index (auto-embeds in background by default)
 "$SCS" refresh --quiet 2>/dev/null
-"$SCS" embed --quiet 2>/dev/null
 
 # Generate project map
 "$SCS" map 2>/dev/null
