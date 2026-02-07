@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,34 @@ pub mod summarizer;
 // Global quiet mode flag
 static QUIET_MODE: AtomicBool = AtomicBool::new(false);
 
+// Global log directory (.scs/)
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Initialize the log directory for file-based logging.
+pub fn init_log_dir(dir: PathBuf) {
+    let _ = LOG_DIR.set(dir);
+}
+
+/// Write a log line to `.scs/scs.log`. Rotates to `scs.log.old` at 512KB.
+pub fn log_to_file(level: &str, msg: &str) {
+    if let Some(dir) = LOG_DIR.get() {
+        let log_path = dir.join("scs.log");
+        // Rotate if > 512KB
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > 512 * 1024 {
+                let _ = std::fs::rename(&log_path, dir.join("scs.log.old"));
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path)
+        {
+            use std::io::Write;
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(f, "[{}] {} {}", now, level, msg);
+        }
+    }
+}
+
 /// Set global quiet mode (suppresses warnings)
 pub fn set_quiet_mode(quiet: bool) {
     QUIET_MODE.store(quiet, Ordering::SeqCst);
@@ -25,14 +54,25 @@ pub fn is_quiet() -> bool {
     QUIET_MODE.load(Ordering::SeqCst)
 }
 
-/// Print warning only if not in quiet mode
+/// Print warning to stderr (if not quiet) and always log to file.
 #[macro_export]
 macro_rules! warn {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        $crate::log_to_file("WARN", &msg);
         if !$crate::is_quiet() {
-            eprintln!($($arg)*);
+            eprintln!("{}", msg);
         }
-    };
+    }};
+}
+
+/// Log to file only (no stderr output).
+#[macro_export]
+macro_rules! scs_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        $crate::log_to_file("INFO", &msg);
+    }};
 }
 
 // ============================================================================
@@ -437,6 +477,7 @@ impl SCS {
     /// Try to ensure index is fresh, but use cached data if locked.
     pub async fn try_ensure_fresh(&mut self, mode: EmbedMode) -> Result<Option<IncrementalStats>> {
         if let Some(pid) = self.index.check_lock() {
+            scs_log!("[refresh] locked by PID {}, using cached data", pid);
             eprintln!(
                 "[scs] Index locked by PID {}. Using cached data (may be slightly stale).",
                 pid
@@ -648,6 +689,11 @@ impl SCS {
         self.index.index.last_indexed = chrono::Utc::now().to_rfc3339();
         self.index.save()
             .context("Failed to save index")?;
+
+        scs_log!(
+            "[refresh] {} added, {} updated, {} removed (pending_embed={})",
+            stats.added, stats.updated, stats.removed, stats.pending_embeddings
+        );
 
         Ok(stats)
     }
@@ -1027,6 +1073,7 @@ impl SCS {
         let needed = Self::collect_needed_dir_file_summaries(dirs, &cache);
 
         if !needed.is_empty() {
+            scs_log!("[map] generating {} map summaries", needed.len());
             match summarizer::gemini::GeminiClient::from_env() {
                 Ok(client) => {
                     for batch in needed.chunks(50) {
@@ -1071,6 +1118,7 @@ impl SCS {
         }
 
         if !needed.is_empty() {
+            scs_log!("[map] generating {} tree summaries", needed.len());
             match summarizer::gemini::GeminiClient::from_env() {
                 Ok(client) => {
                     for batch in needed.chunks(50) {
@@ -1374,6 +1422,9 @@ impl SCS {
             anyhow::bail!("batch_size must be greater than 0");
         }
 
+        let total_missing = self.missing_embeddings_count();
+        scs_log!("[embed] starting: {} chunks pending, batch_size={}", total_missing, batch_size);
+
         // Check rate limits first (requires mutable borrow)
         if let Some(ref mut embedder) = self.embedder {
             if let Err(e) = embedder.check_rate_limits().await {
@@ -1440,6 +1491,8 @@ impl SCS {
 
             tokio::task::yield_now().await;
         }
+
+        scs_log!("[embed] completed: {} embeddings generated", generated);
 
         Ok(generated)
     }

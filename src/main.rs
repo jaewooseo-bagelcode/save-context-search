@@ -107,6 +107,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Err(e) = run().await {
+        save_context_search::log_to_file("ERROR", &format!("{:?}", e));
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Determine project root (canonicalize to absolute path for consistent matching)
@@ -118,9 +126,11 @@ async fn main() -> Result<()> {
 
     // Load or create SCS instance
     let mut scs = SCS::load_or_create(&root).context("Failed to initialize SCS")?;
+    save_context_search::init_log_dir(scs.index.index_dir.clone());
 
     match cli.command {
         Commands::Search { query, top, filter } => {
+            save_context_search::scs_log!("[cmd] search {:?}", query);
             // Try to ensure index is fresh (auto mode for search)
             // If locked (e.g., background embedding), use cached data
             let stats_opt = scs.try_ensure_fresh(EmbedMode::Auto).await.context("Failed to refresh index")?;
@@ -158,6 +168,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Lookup { name, filter } => {
+            save_context_search::scs_log!("[cmd] lookup {:?}", name);
             // Lookup doesn't need embeddings, try to refresh but use cache if locked
             scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
 
@@ -171,6 +182,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status => {
+            save_context_search::scs_log!("[cmd] status");
             let status = scs.status();
             println!(
                 "{}",
@@ -179,6 +191,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Refresh { quiet, no_embed } => {
+            save_context_search::scs_log!("[cmd] refresh quiet={} no_embed={}", quiet, no_embed);
             // Set quiet mode to suppress warnings
             save_context_search::set_quiet_mode(quiet);
 
@@ -214,6 +227,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Reindex { no_embed } => {
+            save_context_search::scs_log!("[cmd] reindex no_embed={}", no_embed);
             let mode = if no_embed { EmbedMode::Skip } else { EmbedMode::Auto };
             eprintln!("Rebuilding index{}...", if no_embed { " (no embeddings)" } else { "" });
             scs.reindex_all(mode).await.context("Failed to reindex")?;
@@ -221,6 +235,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Embed { batch } => {
+            save_context_search::scs_log!("[cmd] embed batch={:?}", batch);
             let missing = scs.missing_embeddings_count();
             if missing == 0 {
                 eprintln!("All chunks already have embeddings");
@@ -244,6 +259,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Map { max_tokens, area } => {
+            save_context_search::scs_log!("[cmd] map area={:?}", area);
             // Ensure index is fresh (no embedding needed for map)
             scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
 
@@ -332,6 +348,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Summarize { batch, force, dry_run } => {
+            save_context_search::scs_log!("[cmd] summarize batch={} force={} dry_run={}", batch, force, dry_run);
             // Ensure index is fresh
             scs.try_ensure_fresh(EmbedMode::Skip).await.context("Failed to refresh index")?;
 
